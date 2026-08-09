@@ -2,7 +2,8 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::comparison_chain)]
 
-pub mod check_log;
+pub mod checker;
+pub mod common;
 pub mod conn_util;
 pub mod data_marker;
 pub mod extractor;
@@ -12,12 +13,11 @@ pub mod rdb_router;
 pub mod sinker;
 
 use async_trait::async_trait;
-use check_log::check_log::CheckLog;
+use checker::check_log::CheckLog;
 use dt_common::meta::{
-    dcl_meta::dcl_data::DclData, ddl_meta::ddl_data::DdlData, dt_data::DtItem, row_data::RowData,
-    struct_meta::struct_data::StructData,
+    dcl_meta::dcl_data::DclData, ddl_meta::ddl_data::DdlData, dt_data::DtItem, position::Position,
+    row_data::RowData, struct_meta::struct_data::StructData,
 };
-
 #[async_trait]
 pub trait Sinker {
     async fn sink_dml(&mut self, mut _data: Vec<RowData>, _batch: bool) -> anyhow::Result<()> {
@@ -36,6 +36,14 @@ pub trait Sinker {
         Ok(())
     }
 
+    async fn close_with_position(&mut self, _position: Option<&Position>) -> anyhow::Result<()> {
+        self.close().await
+    }
+
+    async fn record_checkpoint(&mut self, _position: &Position) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn sink_raw(&mut self, mut _data: Vec<DtItem>, _batch: bool) -> anyhow::Result<()> {
         Ok(())
     }
@@ -45,6 +53,10 @@ pub trait Sinker {
     }
 
     async fn refresh_meta(&mut self, _data: Vec<DdlData>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn handle_control_item(&mut self, _item: &DtItem) -> anyhow::Result<()> {
         Ok(())
     }
 

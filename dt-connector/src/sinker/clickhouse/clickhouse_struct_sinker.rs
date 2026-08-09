@@ -3,7 +3,8 @@ use crate::{rdb_router::RdbRouter, Sinker};
 use anyhow::bail;
 use clickhouse::Client;
 use dt_common::{
-    config::config_enums::ConflictPolicyEnum,
+    config::config_enums::{ConflictPolicyEnum, DbType},
+    error::DtError,
     log_error, log_info,
     meta::{
         mysql::{mysql_col_type::MysqlColType, mysql_tb_meta::MysqlTbMeta},
@@ -31,14 +32,13 @@ pub struct ClickhouseStructSinker {
     pub conflict_policy: ConflictPolicyEnum,
     pub engine: String,
     pub filter: RdbFilter,
-    pub router: RdbRouter,
+    pub router: Option<RdbRouter>,
     pub extractor_meta_manager: RdbMetaManager,
 }
 
 #[async_trait]
 impl Sinker for ClickhouseStructSinker {
     async fn sink_struct(&mut self, data: Vec<StructData>) -> anyhow::Result<()> {
-        let reverse_router = self.router.reverse();
         for i in data {
             match i.statement {
                 StructStatement::MysqlCreateDatabase(statement) => {
@@ -50,8 +50,17 @@ impl Sinker for ClickhouseStructSinker {
                 }
 
                 StructStatement::MysqlCreateTable(statement) => {
-                    let (schema, tb) = reverse_router
-                        .get_tb_map(&statement.table.database_name, &statement.table.table_name);
+                    let (schema, tb) = if let Some(router) = &self.router {
+                        router.reverse_get_tb_map(
+                            &statement.table.database_name,
+                            &statement.table.table_name,
+                        )
+                    } else {
+                        (
+                            statement.table.database_name.as_str(),
+                            statement.table.table_name.as_str(),
+                        )
+                    };
                     if let Some(meta_manager) =
                         self.extractor_meta_manager.mysql_meta_manager.as_mut()
                     {
@@ -68,8 +77,17 @@ impl Sinker for ClickhouseStructSinker {
                 }
 
                 StructStatement::PgCreateTable(statement) => {
-                    let (schema, tb) = reverse_router
-                        .get_tb_map(&statement.table.schema_name, &statement.table.table_name);
+                    let (schema, tb) = if let Some(router) = &self.router {
+                        router.reverse_get_tb_map(
+                            &statement.table.schema_name,
+                            &statement.table.table_name,
+                        )
+                    } else {
+                        (
+                            statement.table.schema_name.as_str(),
+                            statement.table.table_name.as_str(),
+                        )
+                    };
                     if let Some(meta_manager) = self.extractor_meta_manager.pg_meta_manager.as_mut()
                     {
                         let tb_meta = meta_manager.get_tb_meta(schema, tb).await?.to_owned();
@@ -100,7 +118,14 @@ impl ClickhouseStructSinker {
         let rdb_tb_meta = if let Some(tb_meta) = pg_tb_meta {
             &tb_meta.basic
         } else {
-            &mysql_tb_meta.as_ref().unwrap().basic
+            &mysql_tb_meta
+                .ok_or_else(|| {
+                    DtError::DatabaseMetadataNotFound(
+                        DbType::ClickHouse,
+                        "Ape-DTS could not determine the source table definition needed to build the ClickHouse table".to_string(),
+                    )
+                })?
+                .basic
         };
 
         let mut dst_cols = vec![];
@@ -147,7 +172,15 @@ impl ClickhouseStructSinker {
         let dst_col_type = if let Some(tb_meta) = mysql_tb_meta {
             Self::get_dst_col_type_from_mysql(col, tb_meta)
         } else {
-            Self::get_dst_col_type_from_pg(col, pg_tb_meta.unwrap())
+            Self::get_dst_col_type_from_pg(
+                col,
+                pg_tb_meta.ok_or_else(|| {
+                    DtError::DatabaseMetadataNotFound(
+                        DbType::ClickHouse,
+                        "Ape-DTS could not determine the source table definition needed to build the ClickHouse table".to_string(),
+                    )
+                })?,
+            )
         }?;
 
         // Nested type Array() cannot be inside Nullable type
@@ -203,6 +236,15 @@ impl ClickhouseStructSinker {
             | MysqlColType::MediumBlob
             | MysqlColType::Blob
             | MysqlColType::LongBlob => "String",
+
+            MysqlColType::Geometry
+            | MysqlColType::Point
+            | MysqlColType::LineString
+            | MysqlColType::Polygon
+            | MysqlColType::MultiPoint
+            | MysqlColType::MultiLineString
+            | MysqlColType::MultiPolygon
+            | MysqlColType::GeometryCollection => "String",
 
             MysqlColType::Bit => "UInt64",
             MysqlColType::Set { items: _ } => "String",

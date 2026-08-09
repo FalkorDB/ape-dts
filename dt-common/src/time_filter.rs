@@ -1,7 +1,9 @@
 use anyhow::Context;
 
+use crate::error::DtError;
 use crate::utils::time_util::TimeUtil;
 
+#[derive(Clone)]
 pub struct TimeFilter {
     // timestamp in UTC
     pub start_timestamp: u32,
@@ -16,9 +18,9 @@ impl TimeFilter {
             0
         } else {
             TimeUtil::datetime_from_utc_str(start_time_utc)
-                .with_context(|| {
-                    format!("time_filter, invalid start_time_utc: [{}]", start_time_utc)
-                })?
+                .context(DtError::invalid_config(
+                    "config [extractor].start_time_utc is invalid",
+                ))?
                 .timestamp() as u32
         };
 
@@ -26,7 +28,9 @@ impl TimeFilter {
             u32::MAX
         } else {
             TimeUtil::datetime_from_utc_str(end_time_utc)
-                .with_context(|| format!("time_filter, invalid end_time_utc: [{}]", end_time_utc))?
+                .context(DtError::invalid_config(
+                    "config [extractor].end_time_utc is invalid",
+                ))?
                 .timestamp() as u32
         };
 

@@ -5,6 +5,7 @@
 - ape-dts is a data migration tool enabling any-to-any data transfers.
 - It also provides data subscription and data processing.
 - It is lightweight, efficient and standalone, requiring no third-party components or extra storage.
+- Designed for cloud-native stateless component scenarios.
 - In Rust.
 
 ## Key features
@@ -32,6 +33,8 @@
 The dt-main crate provides several optional components which can be enabled via `Cargo [features]`:
 
 - `metrics`: Enable Prometheus format task metrics HTTP service interface.
+  See the [task metrics reference](./docs/en/monitor/task_metrics.md) for metric
+  names, units, and semantics.
   After enabling this feature, you can customize the metrics service with the following configuration:
 
   ```
@@ -49,6 +52,16 @@ The dt-main crate provides several optional components which can be enabled via 
 - TBD
 
 # Quick starts
+
+## CLI
+
+`dtscli` is a lightweight local CLI for creating and managing ApeCloud DTS tasks.
+It can generate task configs, start `dt-main`, list tasks, stream logs, and stop,
+restart, or delete local task records.
+
+![dtscli demo](./docs/img/demo.gif)
+
+For installation and detailed usage, see [dt-cli/README.md](./dt-cli/README.md).
 
 ## Tutorial
 
@@ -77,6 +90,8 @@ Refer to [test docs](./dt-tests/README.md) for details.
 
 - Configurations
   - [config details](./docs/en/config.md)
+- Error handling
+  - [error codes](./docs/en/error_codes.md)
 - Structure tasks
   - [migration](./docs/en/structure/migration.md)
   - [check](./docs/en/structure/check.md)
@@ -172,6 +187,11 @@ Refer to [test docs](./dt-tests/README.md) for details.
 
 - run `cargo clippy --all-targets --all-features --workspace` fix all clippy issues.
 
-# Contact us
+## Community
 
-[Slack Community](https://join.slack.com/t/kubeblocks/shared_invite/zt-22cx2f84x-BPZvnLRqBOGdZ_XSjELh4Q)
+If you have any questions, you can reach out to us through:
+
+- ApeDTS GitHub [Discussions](https://github.com/apecloud/ape-dts/discussions)
+- ApeDTS Wechat Account with note **ape-dts**:
+
+  <img src=".\docs\img\wechat-assistant.png" alt="wechat" width="100" height="100" style="margin-top:10px">

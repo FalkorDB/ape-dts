@@ -51,6 +51,12 @@ INSERT INTO test_db_1.one_pk_multi_uk VALUES (9, NULL, NULL, NULL, NULL, NULL, N
 INSERT INTO test_db_1.col_has_special_character_table VALUES(1, 'col:1:value', 'col&2:value', 'col\3:value');
 INSERT INTO test_db_1.col_has_special_character_table VALUES(2, NULL, NULL, NULL);
 
+INSERT INTO test_db_1.longtext_bin_collation_table VALUES(1, 'abc');
+INSERT INTO test_db_1.longtext_bin_collation_table VALUES(2, 'CaseSensitiveContent');
+
+INSERT INTO test_db_1.enum_set_bin_collation_table VALUES(1, 'small', 'a,b');
+INSERT INTO test_db_1.enum_set_bin_collation_table VALUES(2, 'large', '');
+
 -- min for each col
 INSERT INTO test_db_1.numeric_table VALUES(-128, 0, -32768, 0, -8388608, 0, -2147483648, 0, -9223372036854775808, 0);
 -- max for each col
@@ -71,6 +77,52 @@ INSERT INTO test_db_1.date_time_table VALUES(4, '1000-01-01 00:00:00', '1000-01-
 
 INSERT INTO test_db_1.set_table VALUES(1, ''), (2, 'a'), (3, 'a,b'), (4, 'a,b,c,d,e'), (5, NULL);
 
+INSERT INTO test_db_1.spatial_table VALUES (
+    1,
+    ST_GeomFromText('POINT(0 0)'),
+    ST_GeomFromText('POINT(1 1)'),
+    ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'),
+    ST_GeomFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'),
+    ST_GeomFromText('MULTIPOINT((0 0), (1 1), (2 2))'),
+    ST_GeomFromText('MULTILINESTRING((0 0, 1 1), (2 2, 3 3))'),
+    ST_GeomFromText('MULTIPOLYGON(((0 0, 10 0, 10 10, 0 10, 0 0)), ((20 20, 30 20, 30 30, 20 30, 20 20)))'),
+    ST_GeomFromText('GEOMETRYCOLLECTION(POINT(0 0), LINESTRING(0 0, 1 1))')
+);
+INSERT INTO test_db_1.spatial_table VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+INSERT INTO test_db_1.spatial_table VALUES (
+    3,
+    ST_GeomFromText('LINESTRING(-1.5 -1.5, 0 0, 3.25 4.75)'),
+    ST_GeomFromText('POINT(-73.9857 40.7484)'),
+    ST_GeomFromText('LINESTRING(-10 -10, -5 0, 0 5, 10 10)'),
+    ST_GeomFromText('POLYGON((-5 -5, 5 -5, 5 5, -5 5, -5 -5))'),
+    ST_GeomFromText('MULTIPOINT((-1 -1), (0 0), (1 1))'),
+    ST_GeomFromText('MULTILINESTRING((-1 -1, 0 0), (10 10, 20 20, 30 30))'),
+    ST_GeomFromText('MULTIPOLYGON(((-5 -5, 0 -5, 0 0, -5 0, -5 -5)), ((1 1, 4 1, 4 4, 1 4, 1 1)))'),
+    ST_GeomFromText('GEOMETRYCOLLECTION(POINT(-1 -1), POLYGON((0 0, 2 0, 2 2, 0 2, 0 0)))')
+);
+INSERT INTO test_db_1.spatial_table VALUES (
+    4,
+    ST_GeomFromText('POLYGON((100 100, 110 100, 110 110, 100 110, 100 100))'),
+    ST_GeomFromText('POINT(180 -90)'),
+    ST_GeomFromText('LINESTRING(100 100, 110 105, 120 100)'),
+    ST_GeomFromText('POLYGON((0 0, 8 0, 8 8, 0 8, 0 0), (2 2, 6 2, 6 6, 2 6, 2 2))'),
+    ST_GeomFromText('MULTIPOINT((10 10), (20 20), (30 30), (40 40))'),
+    ST_GeomFromText('MULTILINESTRING((0 0, 0 10), (10 0, 10 10), (20 0, 20 10))'),
+    ST_GeomFromText('MULTIPOLYGON(((0 0, 3 0, 3 3, 0 3, 0 0)), ((5 5, 9 5, 9 9, 5 9, 5 5)))'),
+    ST_GeomFromText('GEOMETRYCOLLECTION(MULTIPOINT((1 1), (2 2)), LINESTRING(3 3, 4 4))')
+);
+INSERT INTO test_db_1.spatial_table VALUES (
+    5,
+    ST_GeomFromText('POINT(9 9)'),
+    NULL,
+    ST_GeomFromText('LINESTRING(9 9, 10 10)'),
+    NULL,
+    ST_GeomFromText('MULTIPOINT((9 9), (10 10))'),
+    NULL,
+    ST_GeomFromText('MULTIPOLYGON(((9 9, 10 9, 10 10, 9 10, 9 9)))'),
+    NULL
+);
+
 -- ignore cols
 INSERT INTO test_db_1.ignore_cols_1 VALUES(1, 1, 1, 1),(2, 2, 2, 2);
 INSERT INTO test_db_1.ignore_cols_2 VALUES(1, 1, 1, 1),(2, 2, 2, 2);
@@ -89,3 +141,36 @@ INSERT INTO test_db_1.where_condition_3 VALUES(1, 1),(2, 2),(3, 3),(4, 4),(5, 5)
 -- test foreign key
 insert into test_db_1.fk_tb_2 VALUES(1,1,1,1),(2,2,2,2);
 insert into test_db_1.fk_tb_1 VALUES(1,1,1,1),(2,2,2,2);
+
+-- test composite primary key
+INSERT INTO test_db_1.composite_pk_table VALUES(1, '1', 1),(2, '2', 2),(3, '3', 3),(4, '4', 4),(5, '5', 5),(6, '6', 6),(7, '7', 7),(8, '8', 8),(9, '9', 9),(10, '10', 10);
+
+-- test non-nullable composite unique key
+INSERT INTO test_db_1.composite_unique_key_table VALUES(1, '1', 1),(2, '2', 2),(3, '3', 3),(4, '4', 4),(5, '5', 5),(6, '6', 6),(7, '7', 7),(8, '8', 8),(9, '9', 9),(10, '10', 10);
+
+--test nullable composite unique key
+INSERT INTO test_db_1.composite_unique_key_table_2 VALUES(1, '1', 1),(2, '2', 2),(3, '3', 3),(4, '4', 4),(5, '5', 5),(6, '6', 6),(7, NULL, 7),(8, '8', NULL),(9, 'null', NULL),(10, NULL, NULL),(NULL, NULL, NULL),(NULL, NULL, NULL);
+
+--test multi primary and single unique key
+INSERT INTO test_db_1.multi_primary_and_single_unique_table VALUES(1, '1', 1, '1', 1),(2, '2', 2, '2', 2),(3, '3', 3, '3', 3),(4, '4', 4, '4', 4),(5, '5', 5, '5', 5),(6, '6', 6, '6', 6),(7, '7', 7, '7', 7),(8, '8', 8, '8', 8),(9, '9', 9, '9', 9),(10, '10', 10, '10', 10);
+
+-- test negative time in composite snapshot order key
+INSERT INTO test_db_1.negative_time_composite_pk_table VALUES
+('-838:59:59.000000', 1901, 1),
+('-707:21:36.670906', 1964, 2),
+('-453:17:21.336220', 2133, 3),
+('-376:04:41.822220', 2014, 4),
+('-85:27:05.424411', 1964, 5),
+('-00:00:00.000001', 1970, 6),
+('00:00:00.000000', 1989, 7),
+('838:59:59.000000', 2155, 8);
+
+INSERT INTO test_db_1.negative_time_composite_uk_table VALUES
+('-838:59:59.000000', 1901, 1),
+('-707:21:36.670906', 1964, 2),
+('-453:17:21.336220', 2133, 3),
+('-376:04:41.822220', 2014, 4),
+('-85:27:05.424411', 1964, 5),
+('-00:00:00.000001', 1970, 6),
+('00:00:00.000000', 1989, 7),
+('838:59:59.000000', 2155, 8);

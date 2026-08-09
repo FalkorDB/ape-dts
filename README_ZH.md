@@ -4,6 +4,7 @@
 
 - ape-dts 是一款旨在实现 any-to-any 的数据迁移工具，并具有数据订阅和数据加工能力。
 - 简单、轻量、高效，不依赖第三方组件和额外存储。
+- 面向云原生无状态组件场景设计
 - 使用 Rust。
 
 ## 主要特性
@@ -19,8 +20,6 @@
 
 目前支持的成熟任务类型：
 
-<br/>
-
 |                    | mysql -> mysql | pg -> pg | mongo -> mongo | redis -> redis | mysql -> kafka | pg -> kafka | mysql -> starrocks | mysql -> clickhouse | mysql -> tidb | pg -> starrocks | pg -> clickhouse | mysql -> doris | pg -> doris |
 | :----------------- | :------------- | :------- | :------------- | :------------- | :------------- | :---------- | :----------------- | :------------------ | :------------ | :-------------- | :--------------- | :------------- | :---------- |
 | 全量迁移           | &#10004;       | &#10004; | &#10004;       | &#10004;       | &#10004;       | &#10004;    | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
@@ -35,6 +34,7 @@
 dt-main crate 提供了几个可选组件，可以通过 `Cargo [features]` 启用：
 
 - `metrics`: 启用 Prometheus 格式的任务指标 HTTP 服务接口。
+  指标名称、单位和语义请参阅 [Task metrics 指标说明](./docs/zh/monitor/task_metrics.md)。
   启用此功能后，您可以通过以下配置自定义指标服务：
 
   ```
@@ -52,6 +52,15 @@ dt-main crate 提供了几个可选组件，可以通过 `Cargo [features]` 启�
 - TBD
 
 # 快速上手
+
+## CLI
+
+`dtscli` 是一个轻量的本地命令行工具，用于创建和管理 ApeCloud DTS 任务。
+它可以生成任务配置、启动 `dt-main`、查看任务列表、持续查看日志，以及停止、重启或删除本地任务记录。
+
+![dtscli 演示](./docs/img/demo.gif)
+
+安装和详细使用请参考 [dt-cli/README.md](./dt-cli/README.md)。
 
 ## 教程
 
@@ -80,6 +89,8 @@ dt-main crate 提供了几个可选组件，可以通过 `Cargo [features]` 启�
 
 - 配置
   - [配置详解](./docs/zh/config.md)
+- 错误处理
+  - [错误码](./docs/zh/error_codes.md)
 - 库表结构任务
   - [结构迁移](./docs/zh/structure/migration.md)
   - [结构校验](./docs/zh/structure/check.md)
@@ -174,6 +185,11 @@ dt-main crate 提供了几个可选组件，可以通过 `Cargo [features]` 启�
 
 - 执行 `cargo clippy --all-targets --all-features --workspace` 并修复所有警告
 
-# 技术交流
+## 社区
 
-[Slack 社区](https://join.slack.com/t/kubeblocks/shared_invite/zt-22cx2f84x-BPZvnLRqBOGdZ_XSjELh4Q)
+如有任何问题，欢迎通过以下方式联系我们：
+
+- ApeDTS GitHub [讨论区](https://github.com/apecloud/ape-dts/discussions)
+- ApeDTS 微信公众号，添加时请备注 **ape-dts**：
+
+  <img src=".\docs\img\wechat-assistant.png" alt="wechat" width="100" height="100" style="margin-top:10px">

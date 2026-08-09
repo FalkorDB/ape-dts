@@ -1,6 +1,14 @@
-use crate::rdb_filter::RdbFilter;
+use crate::{
+    meta::struct_meta::statement::{
+        pg_create_udf_statement::PgCreateUdfStatement,
+        pg_create_udt_statement::PgCreateUdtStatement,
+    },
+    rdb_filter::RdbFilter,
+};
 
 use super::{
+    mongo_create_collection_statement::MongoCreateCollectionStatement,
+    mongo_shard_key_statement::MongoShardKeyStatement,
     mysql_create_database_statement::MysqlCreateDatabaseStatement,
     mysql_create_table_statement::MysqlCreateTableStatement,
     pg_create_rbac_statement::PgCreateRbacStatement,
@@ -13,8 +21,12 @@ pub enum StructStatement {
     MysqlCreateDatabase(MysqlCreateDatabaseStatement),
     PgCreateSchema(PgCreateSchemaStatement),
     MysqlCreateTable(MysqlCreateTableStatement),
+    MongoCreateCollection(MongoCreateCollectionStatement),
+    MongoShardKey(MongoShardKeyStatement),
     PgCreateTable(PgCreateTableStatement),
     PgCreateRbac(PgCreateRbacStatement),
+    PgCreateUdf(PgCreateUdfStatement),
+    PgCreateUdt(PgCreateUdtStatement),
     #[default]
     Unknown,
 }
@@ -25,8 +37,12 @@ impl StructStatement {
             Self::MysqlCreateDatabase(s) => s.to_sqls(filter),
             Self::PgCreateSchema(s) => s.to_sqls(filter),
             Self::MysqlCreateTable(s) => s.to_sqls(filter),
+            Self::MongoCreateCollection(_) => Ok(vec![]),
+            Self::MongoShardKey(_) => Ok(vec![]),
             Self::PgCreateTable(s) => s.to_sqls(filter),
             Self::PgCreateRbac(s) => s.to_sqls(filter),
+            Self::PgCreateUdf(s) => s.to_sqls(filter),
+            Self::PgCreateUdt(s) => s.to_sqls(filter),
             _ => Ok(vec![]),
         }
     }

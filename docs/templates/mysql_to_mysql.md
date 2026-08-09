@@ -226,7 +226,9 @@ url=mysql://root:123456@127.0.0.1:3307?ssl-mode=disabled
 db_type=mysql
 sink_type=check
 url=mysql://root:123456@127.0.0.1:3308?ssl-mode=disabled
-replace=true
+
+[checker]
+
 
 [filter]
 do_dbs=test_db
@@ -255,7 +257,7 @@ log_dir=./logs
 
 - the output will be in {log_dir}/check/
 
-# Data check
+# Standalone snapshot check
 
 ```
 [extractor]
@@ -268,6 +270,55 @@ batch_size=10000
 db_type=mysql
 sink_type=check
 url=mysql://root:123456@127.0.0.1:3308?ssl-mode=disabled
+
+[checker]
+batch_size=100
+
+[filter]
+do_dbs=
+ignore_dbs=
+do_tbs=test_db.*
+ignore_tbs=
+do_events=insert
+
+[router]
+db_map=
+tb_map=
+col_map=
+
+[parallelizer]
+parallel_type=rdb_merge
+parallel_size=8
+
+[pipeline]
+buffer_size=16000
+checkpoint_interval_secs=10
+
+[runtime]
+log_level=info
+log4rs_file=./log4rs.yaml
+log_dir=./logs
+```
+
+- the output will be in {log_dir}/check/
+
+# Inline snapshot check
+
+```
+[extractor]
+db_type=mysql
+extract_type=snapshot
+url=mysql://root:123456@127.0.0.1:3307?ssl-mode=disabled
+batch_size=10000
+
+[sinker]
+db_type=mysql
+sink_type=write
+url=mysql://root:123456@127.0.0.1:3308?ssl-mode=disabled
+batch_size=200
+replace=true
+
+[checker]
 batch_size=200
 
 [filter]
@@ -283,7 +334,7 @@ tb_map=
 col_map=
 
 [parallelizer]
-parallel_type=rdb_check
+parallel_type=snapshot
 parallel_size=8
 
 [pipeline]
@@ -297,6 +348,69 @@ log_dir=./logs
 ```
 
 - the output will be in {log_dir}/check/
+- `[checker]` intentionally omits `db_type` / `url` / `username` / `password`; inline snapshot
+  check reuses the parsed `[sinker]` target.
+
+# Inline cdc check
+
+```
+[extractor]
+db_type=mysql
+extract_type=cdc
+binlog_position=5299302
+binlog_filename=mysql-bin.000035
+server_id=2000
+heartbeat_interval_secs=1
+heartbeat_tb=heartbeat_db.ape_dts_heartbeat
+url=mysql://root:123456@127.0.0.1:3307?ssl-mode=disabled
+
+[filter]
+ignore_dbs=
+do_dbs=
+do_tbs=test_db.*
+ignore_tbs=
+do_events=insert,update,delete
+
+[sinker]
+db_type=mysql
+sink_type=write
+batch_size=200
+url=mysql://root:123456@127.0.0.1:3308?ssl-mode=disabled
+replace=true
+
+[checker]
+batch_size=200
+
+[checker_cdc]
+is_enabled=true
+
+[resumer]
+resume_type=from_target
+table_full_name=apecloud_metadata.apedts_task_position
+
+[router]
+tb_map=
+col_map=
+db_map=
+
+[parallelizer]
+parallel_type=rdb_merge
+parallel_size=8
+
+[pipeline]
+buffer_size=16000
+checkpoint_interval_secs=10
+
+[runtime]
+log_dir=./logs
+log_level=info
+log4rs_file=./log4rs.yaml
+```
+
+- the output will be in {log_dir}/check/
+- Inline CDC check reuses the parsed `[sinker]` target, is enabled by
+  `[checker_cdc].is_enabled=true`, requires `[resumer]`, and uses
+  `[parallelizer].parallel_type=rdb_merge`. Common check options remain under `[checker]`.
 
 # Data revise
 
@@ -360,7 +474,9 @@ batch_size=200
 db_type=mysql
 sink_type=check
 url=mysql://root:123456@127.0.0.1:3308?ssl-mode=disabled
-batch_size=200
+
+[checker]
+batch_size=100
 
 [filter]
 do_dbs=
@@ -375,7 +491,7 @@ tb_map=
 col_map=
 
 [parallelizer]
-parallel_type=rdb_check
+parallel_type=rdb_merge
 parallel_size=8
 
 [pipeline]

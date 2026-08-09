@@ -1,19 +1,49 @@
 use std::io::Cursor;
 
-use crate::{config::config_enums::DbType, error::Error, meta::time::dt_utc_time::DtNaiveTime};
 use anyhow::bail;
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
+use sqlx::{mysql::MySqlRow, types::BigDecimal, Row};
+
 use mysql_binlog_connector_rust::column::{
     column_value::ColumnValue, json::json_binary::JsonBinary,
 };
-use sqlx::{mysql::MySqlRow, types::BigDecimal, Row};
 
-use crate::meta::{col_value::ColValue, mysql::mysql_col_type::MysqlColType};
+use crate::{
+    config::config_enums::DbType,
+    error::DtError,
+    meta::{
+        col_value::ColValue, mysql::mysql_col_type::MysqlColType, time::dt_utc_time::DtNaiveTime,
+    },
+    utils::sql_util::SqlUtil,
+};
 
 pub struct MysqlColValueConvertor {}
 
 impl MysqlColValueConvertor {
+    // ref https://dev.mysql.com/doc/refman/8.0/en/gis-data-formats.html
+    fn normalize_spatial_binlog_value(value: Vec<u8>) -> Vec<u8> {
+        if value.len() > 4 && Self::looks_like_wkb(&value[4..]) {
+            value[4..].to_vec()
+        } else {
+            value
+        }
+    }
+
+    fn looks_like_wkb(value: &[u8]) -> bool {
+        if value.len() < 5 {
+            return false;
+        }
+
+        let geometry_type = match value[0] {
+            0 => u32::from_be_bytes([value[1], value[2], value[3], value[4]]),
+            1 => u32::from_le_bytes([value[1], value[2], value[3], value[4]]),
+            _ => return false,
+        } % 1000;
+
+        (1..=7).contains(&geometry_type)
+    }
+
     pub fn parse_time(buf: Vec<u8>) -> anyhow::Result<ColValue> {
         // for: 13:14:15.456, buf: [12, 0, 0, 0, 0, 0, 13, 14, 15, 64, 245, 6, 0]
         // for: -838:59:59, buf: [8, 1, 34, 0, 0, 0, 22, 59, 59]
@@ -187,6 +217,8 @@ impl MysqlColValueConvertor {
                 if col_type.is_string() {
                     // tinytext, mediumtext, longtext, text
                     ColValue::RawString(v)
+                } else if col_type.is_spatial() {
+                    ColValue::Blob(Self::normalize_spatial_binlog_value(v))
                 } else {
                     // tinyblob, mediumblob, longblob, blob
                     ColValue::Blob(v)
@@ -321,12 +353,20 @@ impl MysqlColValueConvertor {
 
                 MysqlColType::Binary { .. }
                 | MysqlColType::VarBinary { .. }
+                | MysqlColType::Geometry
+                | MysqlColType::Point
+                | MysqlColType::LineString
+                | MysqlColType::Polygon
+                | MysqlColType::MultiPoint
+                | MysqlColType::MultiLineString
+                | MysqlColType::MultiPolygon
+                | MysqlColType::GeometryCollection
                 | MysqlColType::TinyBlob
                 | MysqlColType::MediumBlob
                 | MysqlColType::Blob
-                | MysqlColType::LongBlob
-                | MysqlColType::Unknown => {
-                    bail! {Error::Unexpected(format!(
+                | MysqlColType::LongBlob => ColValue::Blob(hex::decode(value_str)?),
+                MysqlColType::Unknown => {
+                    bail! {DtError::UnsupportedTableStructure(format!(
                         "unsupported column type: {:?}",
                         col_type
                     )) }
@@ -352,7 +392,7 @@ impl MysqlColValueConvertor {
     ) -> anyhow::Result<ColValue> {
         let value: Option<Vec<u8>> = row.get_unchecked(col);
         if value.is_none() {
-            return Self::from_query_none_value(col_type);
+            return Self::from_query_none_value(row, col, col_type);
         }
 
         match col_type {
@@ -400,21 +440,14 @@ impl MysqlColValueConvertor {
                 let value: BigDecimal = row.get_unchecked(col);
                 Ok(ColValue::Decimal(value.to_string()))
             }
-            MysqlColType::Time { .. } => match db_type {
-                DbType::Foxlake => {
-                    let value: Vec<u8> = row.get_unchecked(col);
-                    let str: String = String::from_utf8_lossy(&value).to_string();
-                    Ok(ColValue::Time(str))
-                }
-                _ => {
-                    // do not use chrono::NaiveTime since it ignores year
-                    // let value: chrono::NaiveTime = row.try_get(col)?;
-                    let buf: Vec<u8> = row.get_unchecked(col);
-                    Self::parse_time(buf)
-                }
-            },
+            MysqlColType::Time { .. } => {
+                // do not use chrono::NaiveTime since it ignores year
+                // let value: chrono::NaiveTime = row.try_get(col)?;
+                let buf: Vec<u8> = row.get_unchecked(col);
+                Self::parse_time(buf)
+            }
             MysqlColType::Date { .. } => match db_type {
-                DbType::StarRocks | DbType::Foxlake => {
+                DbType::StarRocks => {
                     let value: Vec<u8> = row.get_unchecked(col);
                     let str: String = String::from_utf8_lossy(&value).to_string();
                     Ok(ColValue::Date(str))
@@ -425,7 +458,7 @@ impl MysqlColValueConvertor {
                 }
             },
             MysqlColType::DateTime { .. } => match db_type {
-                DbType::StarRocks | DbType::Foxlake => {
+                DbType::StarRocks => {
                     let value: Vec<u8> = row.get_unchecked(col);
                     let str: String = String::from_utf8_lossy(&value).to_string();
                     Ok(ColValue::DateTime(str))
@@ -437,20 +470,13 @@ impl MysqlColValueConvertor {
                     ))
                 }
             },
-            MysqlColType::Timestamp { .. } => match db_type {
-                DbType::Foxlake => {
-                    let value: Vec<u8> = row.get_unchecked(col);
-                    let str: String = String::from_utf8_lossy(&value).to_string();
-                    Ok(ColValue::Timestamp(str))
-                }
-                _ => {
-                    // we always set session.time_zone='+00:00' for connection
-                    let value: chrono::DateTime<Utc> = row.try_get(col)?;
-                    Ok(ColValue::Timestamp(
-                        value.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
-                    ))
-                }
-            },
+            MysqlColType::Timestamp { .. } => {
+                // we always set session.time_zone='+00:00' for connection
+                let value: chrono::DateTime<Utc> = row.try_get(col)?;
+                Ok(ColValue::Timestamp(
+                    value.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
+                ))
+            }
             MysqlColType::Year => {
                 let value: u16 = row.get_unchecked(col);
                 Ok(ColValue::Year(value))
@@ -461,12 +487,20 @@ impl MysqlColValueConvertor {
             | MysqlColType::MediumText { .. }
             | MysqlColType::Text { .. }
             | MysqlColType::LongText { .. } => {
-                let value: String = row.try_get(col)?;
+                let value = SqlUtil::try_get_mysql_string(row, col)?;
                 Ok(ColValue::String(value))
             }
 
             MysqlColType::Binary { .. }
             | MysqlColType::VarBinary { .. }
+            | MysqlColType::Geometry
+            | MysqlColType::Point
+            | MysqlColType::LineString
+            | MysqlColType::Polygon
+            | MysqlColType::MultiPoint
+            | MysqlColType::MultiLineString
+            | MysqlColType::MultiPolygon
+            | MysqlColType::GeometryCollection
             | MysqlColType::TinyBlob
             | MysqlColType::MediumBlob
             | MysqlColType::Blob
@@ -480,11 +514,11 @@ impl MysqlColValueConvertor {
                 Ok(ColValue::Bit(value))
             }
             MysqlColType::Set { .. } => {
-                let value: String = row.try_get(col)?;
+                let value: String = SqlUtil::try_get_mysql_string(row, col)?;
                 Ok(ColValue::Set2(value))
             }
             MysqlColType::Enum { .. } => {
-                let value: String = row.try_get(col)?;
+                let value: String = SqlUtil::try_get_mysql_string(row, col)?;
                 Ok(ColValue::Enum2(value))
             }
             MysqlColType::Json => {
@@ -500,23 +534,108 @@ impl MysqlColValueConvertor {
         }
     }
 
-    fn from_query_none_value(col_type: &MysqlColType) -> anyhow::Result<ColValue> {
+    fn from_query_none_value(
+        row: &MySqlRow,
+        col: &str,
+        col_type: &MysqlColType,
+    ) -> anyhow::Result<ColValue> {
         // fix: https://github.com/apecloud/ape-dts/issues/328
         // table: CREATE TABLE `a` (`id` int, `value` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00');
         // source value: insert into a values(1, '0000-00-00 00:00:00')
-        // ape-dts extractor get: (1, None)
+        // ape-dts extractor get: (1, None) when using Option to get value.
         // ape-dts sinker: insert into `a` values(1, NULL, NULL, NULL) which will fail
-        match col_type {
-            MysqlColType::Timestamp {
-                is_nullable: false, ..
-            } => Ok(ColValue::Timestamp("0000-00-00 00:00:00".to_string())),
-            MysqlColType::DateTime {
-                is_nullable: false, ..
-            } => Ok(ColValue::DateTime("0000-00-00 00:00:00".to_string())),
-            MysqlColType::Date { is_nullable: false } => {
-                Ok(ColValue::DateTime("0000-00-00".to_string()))
+        if matches!(
+            col_type,
+            MysqlColType::Date { .. }
+                | MysqlColType::Timestamp { .. }
+                | MysqlColType::DateTime { .. }
+        ) && row.try_get_unchecked::<Vec<u8>, _>(col).is_ok()
+        // Determine if it is NULL by checking the unchecked bytes.
+        {
+            match col_type {
+                MysqlColType::Timestamp {
+                    is_nullable: false, ..
+                } => Ok(ColValue::Timestamp("0000-00-00 00:00:00".to_string())),
+                MysqlColType::DateTime {
+                    is_nullable: false, ..
+                } => Ok(ColValue::DateTime("0000-00-00 00:00:00".to_string())),
+                MysqlColType::Date { is_nullable: false } => {
+                    Ok(ColValue::DateTime("0000-00-00".to_string()))
+                }
+                _ => Ok(ColValue::None),
             }
-            _ => Ok(ColValue::None),
+        } else {
+            Ok(ColValue::None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point_wkb() -> Vec<u8> {
+        let mut value = vec![1, 1, 0, 0, 0];
+        value.extend_from_slice(&0f64.to_le_bytes());
+        value.extend_from_slice(&0f64.to_le_bytes());
+        value
+    }
+
+    #[test]
+    fn from_binlog_strips_mysql_spatial_srid_prefix() {
+        let wkb = point_wkb();
+        let mut mysql_internal = 4326u32.to_le_bytes().to_vec();
+        mysql_internal.extend_from_slice(&wkb);
+
+        let value = MysqlColValueConvertor::from_binlog(
+            &MysqlColType::Point,
+            ColumnValue::Blob(mysql_internal),
+        )
+        .unwrap();
+
+        assert_eq!(ColValue::Blob(wkb), value);
+    }
+
+    #[test]
+    fn from_binlog_strips_zero_srid_spatial_prefix() {
+        let wkb = point_wkb();
+        let mut mysql_internal = 0u32.to_le_bytes().to_vec();
+        mysql_internal.extend_from_slice(&wkb);
+
+        let value = MysqlColValueConvertor::from_binlog(
+            &MysqlColType::Point,
+            ColumnValue::Blob(mysql_internal),
+        )
+        .unwrap();
+
+        assert_eq!(ColValue::Blob(wkb), value);
+    }
+
+    #[test]
+    fn from_binlog_keeps_plain_spatial_wkb() {
+        let wkb = point_wkb();
+
+        let value = MysqlColValueConvertor::from_binlog(
+            &MysqlColType::Point,
+            ColumnValue::Blob(wkb.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(ColValue::Blob(wkb), value);
+    }
+
+    #[test]
+    fn from_binlog_keeps_non_spatial_blob_bytes() {
+        let wkb = point_wkb();
+        let mut value = 4326u32.to_le_bytes().to_vec();
+        value.extend_from_slice(&wkb);
+
+        let col_value = MysqlColValueConvertor::from_binlog(
+            &MysqlColType::Blob,
+            ColumnValue::Blob(value.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(ColValue::Blob(value), col_value);
     }
 }

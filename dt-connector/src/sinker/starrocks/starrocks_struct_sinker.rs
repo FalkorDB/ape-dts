@@ -5,6 +5,7 @@ use crate::{close_conn_pool, rdb_router::RdbRouter, Sinker};
 use anyhow::bail;
 use dt_common::{
     config::config_enums::{ConflictPolicyEnum, DbType},
+    error::{DtError, DtErrorContextExt},
     log_error, log_info,
     meta::{
         mysql::{mysql_col_type::MysqlColType, mysql_tb_meta::MysqlTbMeta},
@@ -35,7 +36,7 @@ pub struct StarrocksStructSinker {
     pub conn_pool: Pool<MySql>,
     pub conflict_policy: ConflictPolicyEnum,
     pub filter: RdbFilter,
-    pub router: RdbRouter,
+    pub router: Option<RdbRouter>,
     pub extractor_meta_manager: RdbMetaManager,
     pub backend_count: i32,
 }
@@ -47,7 +48,6 @@ impl Sinker for StarrocksStructSinker {
             self.backend_count = self.get_backend_count().await?;
         }
 
-        let reverse_router = self.router.reverse();
         for i in data {
             match i.statement {
                 StructStatement::MysqlCreateDatabase(statement) => {
@@ -59,8 +59,17 @@ impl Sinker for StarrocksStructSinker {
                 }
 
                 StructStatement::MysqlCreateTable(statement) => {
-                    let (schema, tb) = reverse_router
-                        .get_tb_map(&statement.table.database_name, &statement.table.table_name);
+                    let (schema, tb) = if let Some(router) = &self.router {
+                        router.reverse_get_tb_map(
+                            &statement.table.database_name,
+                            &statement.table.table_name,
+                        )
+                    } else {
+                        (
+                            statement.table.database_name.as_str(),
+                            statement.table.table_name.as_str(),
+                        )
+                    };
                     if let Some(meta_manager) =
                         self.extractor_meta_manager.mysql_meta_manager.as_mut()
                     {
@@ -77,8 +86,17 @@ impl Sinker for StarrocksStructSinker {
                 }
 
                 StructStatement::PgCreateTable(statement) => {
-                    let (schema, tb) = reverse_router
-                        .get_tb_map(&statement.table.schema_name, &statement.table.table_name);
+                    let (schema, tb) = if let Some(router) = &self.router {
+                        router.reverse_get_tb_map(
+                            &statement.table.schema_name,
+                            &statement.table.table_name,
+                        )
+                    } else {
+                        (
+                            statement.table.schema_name.as_str(),
+                            statement.table.table_name.as_str(),
+                        )
+                    };
                     if let Some(meta_manager) = self.extractor_meta_manager.pg_meta_manager.as_mut()
                     {
                         let tb_meta = meta_manager.get_tb_meta(schema, tb).await?.to_owned();
@@ -110,8 +128,17 @@ impl StarrocksStructSinker {
     ) -> anyhow::Result<String> {
         let rdb_tb_meta = if let Some(tb_meta) = pg_tb_meta {
             &tb_meta.basic
+        } else if let Some(tb_meta) = mysql_tb_meta {
+            &tb_meta.basic
         } else {
-            &mysql_tb_meta.as_ref().unwrap().basic
+            return Err(DtError::ObjectNotFound(
+                "source table metadata is missing while building StarRocks DDL".to_string(),
+            )
+                .message("Source table metadata is unavailable for StarRocks structure migration")
+                .hint(
+                    "Verify that the source table still exists and rerun structure migration. If it repeats, contact support with the task ID and error code.",
+                )
+                );
         };
 
         let mut dst_cols = vec![];
@@ -192,8 +219,19 @@ impl StarrocksStructSinker {
         let col = &column.column_name;
         let dst_col_type = if let Some(tb_meta) = mysql_tb_meta {
             self.get_dst_col_type_from_mysql(col, tb_meta)
+        } else if let Some(tb_meta) = pg_tb_meta {
+            self.get_dst_col_type_from_pg(col, tb_meta)
         } else {
-            self.get_dst_col_type_from_pg(col, pg_tb_meta.unwrap())
+            let detail = format!(
+                "source column metadata is missing for {}.{}.{}",
+                rdb_tb_meta.schema, rdb_tb_meta.tb, col
+            );
+            return Err(DtError::ObjectNotFound(detail.clone())
+                .message("Source column metadata is unavailable for StarRocks structure migration")
+                .hint(
+                    "Check whether the source table changed, then restart structure migration to reload its definition.",
+                )
+                );
         }?;
 
         // The delete operation in Doris (-H "merge_type: delete") is implemented by inserting a record marked for deletion,
@@ -281,6 +319,14 @@ impl StarrocksStructSinker {
 
             MysqlColType::Binary { .. }
             | MysqlColType::VarBinary { .. }
+            | MysqlColType::Geometry
+            | MysqlColType::Point
+            | MysqlColType::LineString
+            | MysqlColType::Polygon
+            | MysqlColType::MultiPoint
+            | MysqlColType::MultiLineString
+            | MysqlColType::MultiPolygon
+            | MysqlColType::GeometryCollection
             | MysqlColType::TinyBlob
             | MysqlColType::MediumBlob
             | MysqlColType::Blob
@@ -343,7 +389,7 @@ impl StarrocksStructSinker {
     async fn get_backend_count(&self) -> anyhow::Result<i32> {
         let sql = "SHOW BACKENDS";
         let mut count = 0;
-        let mut rows = sqlx::query(sql).disable_arguments().fetch(&self.conn_pool);
+        let mut rows = sqlx::raw_sql(sql).fetch(&self.conn_pool);
         while (rows.try_next().await?).is_some() {
             count += 1;
         }
@@ -352,7 +398,7 @@ impl StarrocksStructSinker {
 
     async fn execute_sql(&self, sql: &str) -> anyhow::Result<()> {
         log_info!("ddl begin: {}", sql);
-        let query = sqlx::query(sql).disable_arguments();
+        let query = sqlx::raw_sql(sql);
         match query.execute(&self.conn_pool).await {
             Ok(_) => {
                 log_info!("ddl succeed");

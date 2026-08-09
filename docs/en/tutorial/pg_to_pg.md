@@ -103,6 +103,9 @@ SET search_path TO test_db;
 
 # Migrate snapshot data
 
+- To turn this into **inline snapshot check**, keep `[sinker] sink_type=write` and add an empty `[checker]` section or configure its common check options.
+- See [Data Check](../snapshot/check.md#inline-snapshot-check) and the Postgres template for the exact config shape.
+
 ## Prepare data
 
 ```
@@ -162,9 +165,9 @@ SELECT * FROM test_db.tb_1 ORDER BY id;
   4 |     4
 ```
 
-# Check data
+# Standalone snapshot check
 
-- check the differences between target data and source data
+- check the differences between target data and source data in standalone snapshot check mode
 
 ## Prepare data
 
@@ -181,6 +184,7 @@ UPDATE test_db.tb_1 SET value=1 WHERE id=2;
 
 ```
 cat <<EOL > /tmp/ape_dts/task_config.ini
+
 [extractor]
 db_type=pg
 extract_type=snapshot
@@ -191,12 +195,15 @@ db_type=pg
 sink_type=check
 url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
 
+[checker]
+
+
 [filter]
 do_dbs=test_db
 do_events=insert
 
 [parallelizer]
-parallel_type=rdb_check
+parallel_type=rdb_merge
 parallel_size=8
 
 [pipeline]
@@ -217,13 +224,13 @@ docker run --rm --network host \
 - cat /tmp/ape_dts/check_data_task_log/check/miss.log
 
 ```
-{"log_type":"Miss","schema":"test_db","tb":"tb_1","id_col_values":{"id":"1"},"diff_col_values":{}}
+{"schema":"test_db","tb":"tb_1","id_col_values":{"id":"1"}}
 ```
 
 - cat /tmp/ape_dts/check_data_task_log/check/diff.log
 
 ```
-{"log_type":"Diff","schema":"test_db","tb":"tb_1","id_col_values":{"id":"2"},"diff_col_values":{"value":{"src":"2","dst":"1"}}}
+{"schema":"test_db","tb":"tb_1","id_col_values":{"id":"2"},"diff_col_values":{"value":{"src":"2","dst":"1"}}}
 ```
 
 # Revise data
@@ -290,6 +297,7 @@ SELECT * FROM test_db.tb_1 ORDER BY id;
 
 ```
 cat <<EOL > /tmp/ape_dts/task_config.ini
+
 [extractor]
 db_type=pg
 extract_type=check_log
@@ -301,11 +309,14 @@ db_type=pg
 sink_type=check
 url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
 
+[checker]
+
+
 [filter]
 do_events=*
 
 [parallelizer]
-parallel_type=rdb_check
+parallel_type=rdb_merge
 parallel_size=8
 
 [pipeline]
@@ -324,9 +335,13 @@ docker run --rm --network host \
 
 ## Check results
 
-- /tmp/ape_dts/review_data_task_log/check/miss.log and /tmp/ape_dts/review_data_task_log/check/diff.log should be empty
+- /tmp/ape_dts/review_data_task_log/check/miss.log and /tmp/ape_dts/review_data_task_log/check/diff.log should not be generated
 
 # CDC task
+
+- To turn this into **inline cdc check**, add `[checker_cdc] is_enabled=true` plus `[resumer]`, keep
+  `[sinker] sink_type=write`, use `[parallelizer] parallel_type=rdb_merge`, and configure common check options under `[checker]`. See [Data Check](../snapshot/check.md#inline-cdc-check) and the Postgres
+  template.
 
 ## Drop replication slot if exists
 

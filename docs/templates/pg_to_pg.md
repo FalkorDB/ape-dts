@@ -9,12 +9,14 @@ Refer to [config details](/docs/en/config.md) for explanations of common fields.
 extract_type=struct
 db_type=pg
 url=postgres://postgres:postgres@127.0.0.1:5433/postgres?options[statement_timeout]=10s
+max_connections=10
 
 [sinker]
 sink_type=struct
 db_type=pg
 url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
 conflict_policy=interrupt
+max_connections=10
 
 [filter]
 do_dbs=test_schema
@@ -22,7 +24,7 @@ ignore_dbs=
 do_tbs=
 ignore_tbs=
 do_events=
-do_structures=
+do_structures=database,table,constraint,sequence,comment,index
 
 [router]
 db_map=
@@ -50,6 +52,7 @@ db_type=pg
 extract_type=snapshot
 url=postgres://postgres:postgres@127.0.0.1:5433/postgres?options[statement_timeout]=10s
 batch_size=10000
+max_connections=10
 
 [sinker]
 db_type=pg
@@ -57,6 +60,7 @@ sink_type=write
 url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
 batch_size=200
 replace=true
+max_connections=10
 
 [filter]
 do_dbs=
@@ -107,6 +111,7 @@ sink_type=write
 url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
 batch_size=200
 replace=true
+max_connections=10
 
 [router]
 tb_map=
@@ -135,6 +140,46 @@ log4rs_file=./log4rs.yaml
 | start_lsn | the starting lsn to pull wal from, required | 0/406DE430 | -       |
 
 - refer to [create slot and get starting lsn](/docs/en/tutorial/snapshot_and_cdc_without_data_loss.md)
+
+## Replica identity for tables without primary keys
+
+For Postgres CDC, `UPDATE` and `DELETE` on tables without a primary key can fail unless the source table is configured with a replica identity that provides enough old-row information. The recommended practice is to check and fix this before creating the publication / starting CDC.
+
+If a table has no primary key, set either:
+
+- `REPLICA IDENTITY FULL`, or
+- `REPLICA IDENTITY USING INDEX ...` on a suitable unique index
+
+This repo provides a helper script:
+
+```bash
+scripts/pg_replica_identity.sh --mode check --url 'postgres://postgres:postgres@127.0.0.1:5433/postgres'
+```
+
+Available modes:
+
+- `check`: list tables that have no primary key and are still using `REPLICA IDENTITY DEFAULT` / `NOTHING`
+- `plan`: print `ALTER TABLE ... REPLICA IDENTITY FULL` statements, but do not execute them
+- `apply`: execute those `ALTER TABLE ... REPLICA IDENTITY FULL` statements
+
+Examples:
+
+```bash
+# 1) Check all non-system schemas
+scripts/pg_replica_identity.sh --mode check --url 'postgres://postgres:postgres@127.0.0.1:5433/postgres'
+
+# 2) Print ALTER statements for selected schemas only
+scripts/pg_replica_identity.sh --mode plan --url 'postgres://postgres:postgres@127.0.0.1:5433/postgres' --schemas public,test_schema
+
+# 3) Execute the ALTER statements
+scripts/pg_replica_identity.sh --mode apply --url 'postgres://postgres:postgres@127.0.0.1:5433/postgres'
+```
+
+Note:
+
+- The script only targets tables that have no primary key and are not already configured with replica identity `FULL` or `INDEX`.
+- It includes ordinary tables and partitioned tables (`relkind in ('r', 'p')`).
+- Run it before creating the publication / replication slot for the CDC task whenever possible.
 
 # CDC with ddl capture
 
@@ -175,6 +220,9 @@ db_type=pg
 sink_type=check
 url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
 
+[checker]
+
+
 [filter]
 do_dbs=
 ignore_dbs=
@@ -202,7 +250,7 @@ log_dir=./logs
 
 - the output will be in {log_dir}/check/
 
-# Data check
+# Standalone snapshot check
 
 ```
 [extractor]
@@ -215,6 +263,55 @@ batch_size=10000
 db_type=pg
 sink_type=check
 url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
+
+[checker]
+batch_size=100
+
+[filter]
+do_dbs=
+ignore_dbs=
+do_tbs=test_schema.a,test_schema.b
+ignore_tbs=
+do_events=insert
+
+[router]
+db_map=
+tb_map=
+col_map=
+
+[parallelizer]
+parallel_type=rdb_merge
+parallel_size=8
+
+[pipeline]
+buffer_size=16000
+checkpoint_interval_secs=10
+
+[runtime]
+log_level=info
+log4rs_file=./log4rs.yaml
+log_dir=./logs
+```
+
+- the output will be in {log_dir}/check/
+
+# Inline snapshot check
+
+```
+[extractor]
+db_type=pg
+extract_type=snapshot
+url=postgres://postgres:postgres@127.0.0.1:5433/postgres?options[statement_timeout]=10s
+batch_size=10000
+
+[sinker]
+db_type=pg
+sink_type=write
+url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
+batch_size=200
+replace=true
+
+[checker]
 batch_size=200
 
 [filter]
@@ -230,7 +327,7 @@ tb_map=
 col_map=
 
 [parallelizer]
-parallel_type=rdb_check
+parallel_type=snapshot
 parallel_size=8
 
 [pipeline]
@@ -244,6 +341,68 @@ log_dir=./logs
 ```
 
 - the output will be in {log_dir}/check/
+- `[checker]` intentionally omits `db_type` / `url` / `username` / `password`; inline snapshot
+  check reuses the parsed `[sinker]` target.
+
+# Inline cdc check
+
+```
+[extractor]
+db_type=pg
+extract_type=cdc
+url=postgres://postgres:postgres@127.0.0.1:5433/postgres?options[statement_timeout]=10s
+start_lsn=0/406DE430
+slot_name=ape_test
+heartbeat_interval_secs=1
+heartbeat_tb=heartbeat_db.ape_dts_heartbeat
+
+[checker]
+batch_size=200
+
+[checker_cdc]
+is_enabled=true
+
+[resumer]
+resume_type=from_target
+table_full_name=apecloud_metadata.apedts_task_position
+
+[filter]
+do_dbs=
+ignore_dbs=
+do_tbs=test_schema.a,test_schema.b
+ignore_tbs=
+do_events=insert,update,delete
+
+[sinker]
+db_type=pg
+sink_type=write
+url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
+batch_size=200
+replace=true
+
+[router]
+db_map=
+tb_map=
+col_map=
+
+[parallelizer]
+parallel_type=rdb_merge
+parallel_size=8
+
+[pipeline]
+buffer_size=16000
+checkpoint_interval_secs=10
+
+[runtime]
+log_level=info
+log4rs_file=./log4rs.yaml
+log_dir=./logs
+```
+
+- the output will be in {log_dir}/check/
+- Inline CDC check reuses the parsed `[sinker]` target, is enabled by
+  `[checker_cdc].is_enabled=true`, requires `[resumer]`, and uses
+  `[parallelizer].parallel_type=rdb_merge`. Common check options remain under `[checker]`.
 
 # Data revise
 
@@ -307,7 +466,9 @@ batch_size=200
 db_type=pg
 sink_type=check
 url=postgres://postgres:postgres@127.0.0.1:5434/postgres?options[statement_timeout]=10s
-batch_size=200
+
+[checker]
+batch_size=100
 
 [filter]
 do_dbs=
@@ -322,7 +483,7 @@ tb_map=
 col_map=
 
 [parallelizer]
-parallel_type=rdb_check
+parallel_type=rdb_merge
 parallel_size=8
 
 [pipeline]

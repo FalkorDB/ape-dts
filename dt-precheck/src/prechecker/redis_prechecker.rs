@@ -1,7 +1,9 @@
-use std::{sync::atomic::AtomicBool, sync::Arc};
+use std::sync::{atomic::AtomicBool, Arc};
 
+use anyhow::{Context, Error};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use url::Url;
 
 use super::traits::Prechecker;
 use crate::{
@@ -15,17 +17,18 @@ use dt_common::{
         extractor_config::ExtractorConfig,
         task_config::TaskConfig,
     },
-    meta::{dt_queue::DtQueue, syncer::Syncer},
-    monitor::monitor::Monitor,
+    error::DtError,
+    meta::{dt_queue::DtQueue, redis::cluster_node::ClusterNode, syncer::Syncer},
+    monitor::{task_monitor::MonitorType, task_monitor_handle::TaskMonitorHandle},
     rdb_filter::RdbFilter,
     time_filter::TimeFilter,
+    utils::redis_util::RedisUtil,
 };
 use dt_connector::{
     extractor::{
-        base_extractor::BaseExtractor,
+        base_extractor::{BaseExtractor, ExtractState},
         extractor_monitor::ExtractorMonitor,
         redis::{redis_client::RedisClient, redis_psync_extractor::RedisPsyncExtractor},
-        resumer::cdc_resumer::CdcResumer,
     },
     rdb_router::RdbRouter,
 };
@@ -39,29 +42,80 @@ pub struct RedisPrechecker {
 
 const MIN_SUPPORTED_VERSION: f32 = 2.8;
 
+#[derive(Debug, PartialEq, Eq)]
+enum RedisCdcPrecheckMode {
+    ClusterNodePsync,
+    SingleNodePsync,
+}
+
+fn redis_cdc_precheck_mode(is_cluster: bool) -> RedisCdcPrecheckMode {
+    if is_cluster {
+        RedisCdcPrecheckMode::ClusterNodePsync
+    } else {
+        RedisCdcPrecheckMode::SingleNodePsync
+    }
+}
+
+fn redis_cluster_psync_url(base_url: &str, nodes: &[ClusterNode]) -> anyhow::Result<String> {
+    let node = nodes.first().ok_or_else(|| {
+        DtError::PrerequisiteNotMet("source Redis cluster has no master nodes".to_string())
+    })?;
+
+    let mut url = Url::parse(base_url).context(DtError::DatabaseInvalidConfig(
+        DbType::Redis,
+        "source Redis URL is invalid".to_string(),
+    ))?;
+    url.set_host(Some(&node.host)).map_err(|_| {
+        DtError::DatabaseInvalidConfig(
+            DbType::Redis,
+            format!("invalid Redis cluster node host: {}", node.host),
+        )
+    })?;
+    let port = node.port.parse().context(DtError::DatabaseInvalidConfig(
+        DbType::Redis,
+        format!("invalid Redis cluster node port: {}", node.port),
+    ))?;
+    url.set_port(Some(port)).map_err(|_| {
+        DtError::DatabaseInvalidConfig(
+            DbType::Redis,
+            format!("invalid Redis cluster node port: {}", node.port),
+        )
+    })?;
+    Ok(url.to_string())
+}
+
 #[async_trait]
 impl Prechecker for RedisPrechecker {
     async fn build_connection(&mut self) -> anyhow::Result<CheckResult> {
-        self.fetcher.build_connection().await?;
+        let check_error = self.fetcher.build_connection().await.err();
         Ok(CheckResult::build_with_err(
             CheckItem::CheckDatabaseConnection,
             self.is_source,
             DbType::Redis,
-            None,
+            check_error,
             None,
         ))
     }
 
     async fn check_database_version(&mut self) -> anyhow::Result<CheckResult> {
         let version = self.fetcher.fetch_version().await?;
-        let version: f32 = version.parse().unwrap();
-        let check_error = if version < MIN_SUPPORTED_VERSION {
-            Some(anyhow::Error::msg(format!(
-                "redis version:[{}] is NOT supported, the minimum supported version is {}.",
-                version, MIN_SUPPORTED_VERSION
-            )))
-        } else {
-            None
+        let check_error = match version.parse::<f32>() {
+            Ok(version) if version < MIN_SUPPORTED_VERSION => Some(
+                DtError::UnsupportedDatabaseVersion(
+                    DbType::Redis,
+                    format!(
+                        "Redis version {version} is not supported; minimum version is {MIN_SUPPORTED_VERSION}"
+                    ),
+                )
+                .into(),
+            ),
+            Ok(_) => None,
+            Err(error) => Some(
+                Error::new(error).context(DtError::UnsupportedDatabaseVersion(
+                    DbType::Redis,
+                    "Redis returned an invalid version".to_string(),
+                )),
+            ),
         };
 
         Ok(CheckResult::build_with_err(
@@ -74,39 +128,86 @@ impl Prechecker for RedisPrechecker {
     }
 
     async fn check_cdc_supported(&mut self) -> anyhow::Result<CheckResult> {
-        let repl_port = match self.task_config.extractor {
-            ExtractorConfig::RedisCdc { repl_port, .. }
-            | ExtractorConfig::RedisSnapshot { repl_port, .. } => repl_port,
+        let (repl_port, is_cluster) = match self.task_config.extractor {
+            ExtractorConfig::RedisCdc {
+                repl_port,
+                is_cluster,
+                ..
+            }
+            | ExtractorConfig::RedisSnapshot {
+                repl_port,
+                is_cluster,
+                ..
+            } => (repl_port, is_cluster),
             // should never happen since we've already checked the extractor type before into this function
-            _ => 0,
+            _ => (0, None),
         };
-        let buffer = Arc::new(DtQueue::new(1, 0));
+        let precheck_mode = {
+            let conn = self.fetcher.conn.as_mut().ok_or_else(|| {
+                DtError::InvariantViolated(
+                    "the Redis precheck connection is not initialized".to_string(),
+                )
+            })?;
+            redis_cdc_precheck_mode(RedisUtil::is_redis_cluster(conn, is_cluster))
+        };
+
+        let psync_url = if let RedisCdcPrecheckMode::ClusterNodePsync = precheck_mode {
+            let conn = self.fetcher.conn.as_mut().ok_or_else(|| {
+                DtError::InvariantViolated(
+                    "the Redis precheck connection is not initialized".to_string(),
+                )
+            })?;
+            match RedisUtil::get_cluster_master_nodes(conn)
+                .and_then(|nodes| redis_cluster_psync_url(&self.fetcher.url, &nodes))
+            {
+                Ok(url) => url,
+                Err(error) => {
+                    return Ok(CheckResult::build_with_err(
+                        CheckItem::CheckAccountPermission,
+                        self.is_source,
+                        DbType::Redis,
+                        Some(error),
+                        None,
+                    ));
+                }
+            }
+        } else {
+            self.fetcher.url.clone()
+        };
+
+        let buffer = Arc::new(DtQueue::new(1, 0, None, None));
 
         let filter = RdbFilter::from_config(&self.task_config.filter, &DbType::Redis)?;
-        let monitor = Arc::new(Monitor::new("extractor", "", 1, 100, 1));
+        let monitor = TaskMonitorHandle::noop(MonitorType::Extractor);
+
         let base_extractor = BaseExtractor {
             buffer,
             router: RdbRouter::from_config(&self.task_config.router, &DbType::Redis)?,
             shut_down: Arc::new(AtomicBool::new(false)),
-            monitor: ExtractorMonitor::new(monitor).await,
+        };
+        let extract_state = ExtractState {
+            monitor: ExtractorMonitor::new(monitor, String::new()).await,
             data_marker: None,
             time_filter: TimeFilter::default(),
         };
 
         let mut psyncer = RedisPsyncExtractor {
-            conn: RedisClient::new(&self.fetcher.url).await?,
+            conn: RedisClient::new(&psync_url, &self.fetcher.connection_auth).await?,
             repl_id: String::new(),
             repl_offset: 0,
             now_db_id: 0,
             repl_port,
             filter,
             base_extractor,
+            extract_state,
             extract_type: ExtractType::Snapshot,
             syncer: Arc::new(Mutex::new(Syncer::default())),
-            resumer: CdcResumer::default(),
             keepalive_interval_secs: 0,
             heartbeat_interval_secs: 0,
             heartbeat_key: String::new(),
+            recovery: None,
+            cluster_node: None,
+            wait_task_finish: true,
         };
 
         if let Err(error) = psyncer.start_psync().await {
@@ -150,5 +251,39 @@ impl Prechecker for RedisPrechecker {
             None,
             None,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dt_common::meta::redis::cluster_node::ClusterNode;
+
+    fn cluster_node(address: &str) -> ClusterNode {
+        let (host, port) = address.split_once(':').unwrap();
+        ClusterNode {
+            is_master: true,
+            id: "node-1".to_string(),
+            master_id: "-".to_string(),
+            host: host.to_string(),
+            port: port.to_string(),
+            address: address.to_string(),
+            slots: vec![],
+            slot_hash_tag_map: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cluster_cdc_precheck_uses_cluster_master_node_as_psync_target() {
+        assert_eq!(
+            redis_cdc_precheck_mode(true),
+            RedisCdcPrecheckMode::ClusterNodePsync
+        );
+
+        let nodes = vec![cluster_node("10.0.0.2:6380")];
+        let psync_url = redis_cluster_psync_url("redis://user:pass@10.0.0.1:6379/0", &nodes)
+            .expect("cluster node should become psync url");
+
+        assert_eq!(psync_url, "redis://user:pass@10.0.0.2:6380/0");
     }
 }

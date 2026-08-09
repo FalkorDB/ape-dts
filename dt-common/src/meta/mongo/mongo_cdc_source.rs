@@ -1,6 +1,4 @@
-use std::str::FromStr;
-
-use crate::error::Error;
+use crate::error::{DtError, DtErrorContextExt, Stage};
 use strum::IntoStaticStr;
 
 #[derive(Clone, IntoStaticStr, Debug)]
@@ -12,12 +10,15 @@ pub enum MongoCdcSource {
     ChangeStream,
 }
 
-impl FromStr for MongoCdcSource {
-    type Err = Error;
-    fn from_str(str: &str) -> Result<Self, Self::Err> {
-        match str {
+impl MongoCdcSource {
+    pub fn parse(str: &str) -> anyhow::Result<Self> {
+        match str.to_ascii_lowercase().as_str() {
             "op_log" => Ok(Self::OpLog),
-            _ => Ok(Self::ChangeStream),
+            "change_stream" => Ok(Self::ChangeStream),
+            _ => Err(
+                DtError::InvalidConfig(format!("invalid MongoCdcSource: {}", str))
+                    .stage(Stage::Bootstrap),
+            ),
         }
     }
 }

@@ -1,19 +1,23 @@
-use std::{collections::HashSet, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 use chrono::{Duration, Utc};
 use dt_common::{
     config::{
-        config_enums::DbType,
+        config_enums::{DbType, TaskKind},
         config_token_parser::{ConfigTokenParser, TokenEscapePair},
         extractor_config::ExtractorConfig,
+        ini_loader::IniLoader,
         meta_center_config::MetaCenterConfig,
-        sinker_config::SinkerConfig,
         task_config::TaskConfig,
     },
     meta::{ddl_meta::ddl_type::DdlType, time::dt_utc_time::DtNaiveTime},
     rdb_filter::RdbFilter,
     utils::{sql_util::SqlUtil, time_util::TimeUtil},
 };
+use serde::de::DeserializeOwned;
 
 use dt_common::meta::{
     col_value::ColValue, ddl_meta::ddl_parser::DdlParser,
@@ -22,15 +26,21 @@ use dt_common::meta::{
 use dt_connector::{
     meta_fetcher::mysql::mysql_struct_check_fetcher::MysqlStructCheckFetcher, rdb_router::RdbRouter,
 };
-use dt_task::{task_runner::TaskRunner, task_util::TaskUtil};
+use dt_task::task_util::TaskUtil;
 
 use sqlx::{query, types::BigDecimal, MySql, Pool, Postgres, Row};
-use tokio::task::JoinHandle;
+use tokio::{sync::Semaphore, task::JoinHandle};
 
-use crate::test_config_util::TestConfigUtil;
+use crate::{
+    test_config_util::TestConfigUtil,
+    test_runner::mock_data::{
+        context::MockDbContext, mysql_type::MysqlType, pg_type::PgType, MockData,
+    },
+};
 
 use super::{base_test_runner::BaseTestRunner, rdb_util::RdbUtil};
 
+#[derive(Clone)]
 pub struct RdbTestRunner {
     pub base: BaseTestRunner,
     pub src_conn_pool_mysql: Option<Pool<MySql>>,
@@ -39,8 +49,12 @@ pub struct RdbTestRunner {
     pub dst_conn_pool_pg: Option<Pool<Postgres>>,
     pub meta_center_pool_mysql: Option<Pool<MySql>>,
     pub config: TaskConfig,
-    pub router: RdbRouter,
+    pub router: Option<RdbRouter>,
     pub filter: RdbFilter,
+    pub unordered_compare: bool, // whether to compare rows in unordered way
+    pub unordered_compare_threads: usize,
+    pub mock_prepare_only: bool,
+    pub mock_db_tbs: Vec<(String, String)>,
 }
 
 pub const SRC: &str = "src";
@@ -49,10 +63,36 @@ pub const PUBLIC: &str = "public";
 
 const UTC_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
+struct MockDataPrepare {
+    src_prepare_stmts: Vec<String>,
+    dst_prepare_stmts_for_data_task: Vec<String>,
+    dst_prepare_stmts_for_struct_task: Vec<String>,
+    snapshot_dml_stmts: Vec<String>,
+    cdc_insert_stmts: Vec<String>,
+    db_tbs: Vec<(String, String)>,
+}
+
+impl MockDataPrepare {
+    fn from_mock_data<
+        T: crate::test_runner::mock_data::mock_stmt::MockColType + DeserializeOwned,
+    >(
+        mock_data: MockData<T>,
+    ) -> Self {
+        Self {
+            src_prepare_stmts: mock_data.mock_src_prepare_stmts(),
+            dst_prepare_stmts_for_data_task: mock_data.mock_dst_prepare_stmts_for_data_task(),
+            dst_prepare_stmts_for_struct_task: mock_data.mock_dst_prepare_stmts_for_struct_task(),
+            snapshot_dml_stmts: mock_data.mock_dml_stmts(),
+            cdc_insert_stmts: mock_data.mock_insert_stmts(),
+            db_tbs: mock_data.mock_db_tbs(),
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl RdbTestRunner {
     pub async fn new(relative_test_dir: &str) -> anyhow::Result<Self> {
-        let base = BaseTestRunner::new(relative_test_dir).await.unwrap();
+        let mut base = BaseTestRunner::new(relative_test_dir).await.unwrap();
 
         // prepare conn pools
         let mut src_conn_pool_mysql = None;
@@ -61,49 +101,151 @@ impl RdbTestRunner {
         let mut dst_conn_pool_pg = None;
 
         let config = TaskConfig::new(&base.task_config_file).unwrap();
-        let src_db_type = &config.extractor_basic.db_type;
-        let dst_db_type = &config.sinker_basic.db_type;
-        let src_url = &config.extractor_basic.url;
-        let dst_url = &config.sinker_basic.url;
+        let src_db_type = config.extractor_basic.db_type.clone();
+        let src_url = config.extractor_basic.url.clone();
+        let src_connection_auth = config.extractor_basic.connection_auth.clone();
 
-        match src_db_type {
+        let dst_target = config.destination_target();
+        let mut dst_db_type = config.sinker_basic.db_type.clone();
+        let mut dst_url = config.sinker_basic.url.clone();
+        let mut dst_connection_auth = config.sinker_basic.connection_auth.clone();
+        if let Some(target) = dst_target {
+            dst_db_type = target.db_type;
+            dst_url = target.url;
+            dst_connection_auth = target.connection_auth;
+        } else if let Some(target) = config.checker_target() {
+            // Standalone checker tests have no sinker target, but their dst_prepare.sql /
+            // dst_clean.sql still need to be executed against the checker target database.
+            dst_db_type = target.db_type;
+            dst_url = target.url;
+            dst_connection_auth = target.connection_auth;
+        }
+
+        let mysql_conn_settings = Some(vec!["SET FOREIGN_KEY_CHECKS=0"]);
+        let dst_mysql_conn_settings = if matches!(dst_db_type, DbType::StarRocks | DbType::Doris) {
+            None
+        } else {
+            mysql_conn_settings.clone()
+        };
+
+        match &src_db_type {
             DbType::Mysql => {
-                src_conn_pool_mysql =
-                    Some(TaskUtil::create_mysql_conn_pool(src_url, 1, false, true).await?);
+                src_conn_pool_mysql = Some(
+                    TaskUtil::create_mysql_conn_pool(
+                        &src_url,
+                        &src_db_type,
+                        &src_connection_auth,
+                        5,
+                        false,
+                        mysql_conn_settings.clone(),
+                    )
+                    .await?,
+                );
             }
             DbType::Pg => {
-                src_conn_pool_pg =
-                    Some(TaskUtil::create_pg_conn_pool(src_url, 1, false, true).await?);
+                src_conn_pool_pg = Some(
+                    TaskUtil::create_pg_conn_pool(&src_url, &src_connection_auth, 5, false, true)
+                        .await?,
+                );
             }
             _ => {}
         }
 
-        if !dst_url.is_empty() {
-            match dst_db_type {
-                DbType::Mysql
-                | DbType::Foxlake
-                | DbType::StarRocks
-                | DbType::Doris
-                | DbType::Tidb => {
-                    dst_conn_pool_mysql =
-                        Some(TaskUtil::create_mysql_conn_pool(dst_url, 1, false, true).await?);
+        let (mut unordered_compare, unordered_compare_configured, unordered_compare_threads) =
+            Self::load_mock_compare_config(&base.task_config_file)?;
+        let configured_mock_prepare_only =
+            Self::load_mock_prepare_only_config(&base.task_config_file)?;
+        let task_kind = config.task_type().map(|task_type| task_type.kind);
+        let is_struct_task = matches!(task_kind, Some(TaskKind::Struct));
+        let mock_result: Option<MockDataPrepare> = match src_db_type {
+            DbType::Pg => {
+                let context =
+                    Self::detect_pg_mock_context(src_conn_pool_pg.as_ref().unwrap()).await?;
+                MockData::<PgType>::new(&base.task_config_file, context)?
+                    .map(MockDataPrepare::from_mock_data)
+            }
+            DbType::Mysql => {
+                let context =
+                    Self::detect_mysql_mock_context(src_conn_pool_mysql.as_ref().unwrap()).await?;
+                MockData::<MysqlType>::new(&base.task_config_file, context)?
+                    .map(MockDataPrepare::from_mock_data)
+            }
+            _ => None,
+        };
+        let has_mock_data = mock_result.is_some();
+        let mut mock_db_tbs = Vec::new();
+        if let Some(mock_prepare) = mock_result {
+            base.src_prepare_sqls.extend(mock_prepare.src_prepare_stmts);
+            if is_struct_task {
+                base.dst_prepare_sqls
+                    .extend(mock_prepare.dst_prepare_stmts_for_struct_task);
+            } else {
+                base.dst_prepare_sqls
+                    .extend(mock_prepare.dst_prepare_stmts_for_data_task);
+                if matches!(task_kind, Some(TaskKind::Cdc)) {
+                    base.src_test_sqls.extend(mock_prepare.cdc_insert_stmts);
+                } else {
+                    base.src_test_sqls.extend(mock_prepare.snapshot_dml_stmts);
+                }
+            }
+            mock_db_tbs = mock_prepare.db_tbs;
+
+            if !unordered_compare_configured {
+                unordered_compare = true;
+            }
+        }
+        let mock_prepare_only = configured_mock_prepare_only && has_mock_data && !is_struct_task;
+
+        if !dst_url.is_empty() && !mock_prepare_only {
+            match &dst_db_type {
+                DbType::Mysql | DbType::StarRocks | DbType::Doris | DbType::Tidb => {
+                    dst_conn_pool_mysql = Some(
+                        TaskUtil::create_mysql_conn_pool(
+                            &dst_url,
+                            &dst_db_type,
+                            &dst_connection_auth,
+                            5,
+                            false,
+                            dst_mysql_conn_settings,
+                        )
+                        .await?,
+                    );
                 }
                 DbType::Pg => {
-                    dst_conn_pool_pg =
-                        Some(TaskUtil::create_pg_conn_pool(dst_url, 1, false, true).await?);
+                    dst_conn_pool_pg = Some(
+                        TaskUtil::create_pg_conn_pool(
+                            &dst_url,
+                            &dst_connection_auth,
+                            5,
+                            false,
+                            true,
+                        )
+                        .await?,
+                    );
                 }
                 _ => {}
             }
         }
 
         let config = TaskConfig::new(&base.task_config_file).unwrap();
-        let router = RdbRouter::from_config(&config.router, dst_db_type).unwrap();
-        let filter = RdbFilter::from_config(&config.filter, dst_db_type).unwrap();
+        let router = RdbRouter::from_config(&config.router, &dst_db_type).unwrap();
+        let filter = RdbFilter::from_config(&config.filter, &dst_db_type).unwrap();
         let meta_center_pool_mysql = match &config.meta_center {
-            Some(MetaCenterConfig::MySqlDbEngine { url, .. }) => Some(
-                TaskUtil::create_mysql_conn_pool(url, 1, false, true)
-                    .await
-                    .unwrap(),
+            Some(MetaCenterConfig::MySqlDbEngine {
+                url,
+                connection_auth,
+                ..
+            }) => Some(
+                TaskUtil::create_mysql_conn_pool(
+                    url,
+                    &DbType::Mysql,
+                    connection_auth,
+                    1,
+                    false,
+                    mysql_conn_settings.clone(),
+                )
+                .await
+                .unwrap(),
             ),
             _ => None,
         };
@@ -118,6 +260,10 @@ impl RdbTestRunner {
             router,
             filter,
             base,
+            unordered_compare,
+            unordered_compare_threads,
+            mock_prepare_only,
+            mock_db_tbs,
         })
     }
 
@@ -137,6 +283,41 @@ impl RdbTestRunner {
         Ok(())
     }
 
+    async fn detect_mysql_mock_context(pool: &Pool<MySql>) -> anyhow::Result<MockDbContext> {
+        let row = query("SELECT VERSION() AS version").fetch_one(pool).await?;
+        let version: String = row.try_get("version")?;
+        Ok(MockDbContext::new(DbType::Mysql, &version))
+    }
+
+    async fn detect_pg_mock_context(pool: &Pool<Postgres>) -> anyhow::Result<MockDbContext> {
+        let row = query("SHOW server_version").fetch_one(pool).await?;
+        let version: String = row.try_get("server_version")?;
+        Ok(MockDbContext::new(DbType::Pg, &version))
+    }
+
+    fn load_mock_compare_config(config_file: &str) -> anyhow::Result<(bool, bool, usize)> {
+        let loader = IniLoader::new(config_file)?;
+        let unordered_compare_configured = loader.contains("mock", "unordered_compare")
+            || loader.contains("mock", "unorder_compare");
+        let unordered_compare = if loader.contains("mock", "unordered_compare") {
+            loader.get_with_default("mock", "unordered_compare", false)?
+        } else {
+            loader.get_with_default("mock", "unorder_compare", false)?
+        };
+        let unordered_compare_threads =
+            loader.get_with_default("mock", "unordered_compare_threads", 1usize)?;
+        Ok((
+            unordered_compare,
+            unordered_compare_configured,
+            unordered_compare_threads.max(1),
+        ))
+    }
+
+    fn load_mock_prepare_only_config(config_file: &str) -> anyhow::Result<bool> {
+        let loader = IniLoader::new(config_file)?;
+        loader.get_with_default("mock", "prepare_only", false)
+    }
+
     pub async fn get_dst_mysql_version(&self) -> String {
         if let Some(conn_pool) = &self.dst_conn_pool_mysql {
             let meta_manager = MysqlMetaManager::new(conn_pool.clone()).await.unwrap();
@@ -146,6 +327,11 @@ impl RdbTestRunner {
     }
 
     pub async fn run_snapshot_test(&self, compare_data: bool) -> anyhow::Result<()> {
+        if self.mock_prepare_only {
+            self.execute_mock_prepare_only_sqls().await?;
+            return Ok(());
+        }
+
         // prepare src and dst tables
         self.execute_prepare_sqls().await?;
         self.execute_test_sqls().await?;
@@ -159,6 +345,11 @@ impl RdbTestRunner {
             assert!(self.compare_data_for_tbs(&src_db_tbs, &dst_db_tbs).await?)
         }
         Ok(())
+    }
+
+    pub async fn execute_mock_prepare_only_sqls(&self) -> anyhow::Result<()> {
+        self.execute_src_sqls(&self.base.src_prepare_sqls).await?;
+        self.execute_src_sqls(&self.base.src_test_sqls).await
     }
 
     pub async fn run_ddl_test(&self, start_millis: u64, parse_millis: u64) -> anyhow::Result<()> {
@@ -218,10 +409,10 @@ impl RdbTestRunner {
             }
             let src_ddl_sql = src_fetcher
                 .fetch_table(&src_db_tbs[i].0, &src_db_tbs[i].1)
-                .await;
+                .await?;
             let meta_center_ddl_sql = meta_center_fetcher
                 .fetch_table(&dst_db_tbs[i].0, &dst_db_tbs[i].1)
-                .await;
+                .await?;
             assert_eq!(src_ddl_sql, meta_center_ddl_sql);
         }
         Ok(())
@@ -273,7 +464,7 @@ impl RdbTestRunner {
             }
 
             if line.starts_with("--") {
-                let parts: Vec<&str> = line[2..].trim().split('/').collect();
+                let parts: Vec<&str> = line.strip_prefix("--").unwrap().trim().split('/').collect();
                 let current_user = parts[0].trim().to_string();
                 let current_pwd = parts[1].trim().to_string();
 
@@ -284,7 +475,11 @@ impl RdbTestRunner {
                     old_pool.close().await;
                 }
 
-                let url = &self.config.sinker_basic.url;
+                let dst_target = self
+                    .config
+                    .destination_target()
+                    .expect("destination target should exist");
+                let url = &dst_target.url;
                 let conn_str = url.replace(
                     &url[url.find("://").unwrap() + 3..url.find('@').unwrap()],
                     &format!("{}:{}", current_user, current_pwd),
@@ -298,8 +493,7 @@ impl RdbTestRunner {
                         }
                         Err(e) => {
                             if expect_success {
-                                assert!(
-                                    false,
+                                panic!(
                                     "MySQL pool connect failed: {} with user={}, password={}, but expect success",
                                     e, current_user, current_pwd
                                 );
@@ -314,8 +508,7 @@ impl RdbTestRunner {
                         }
                         Err(e) => {
                             if expect_success {
-                                assert!(
-                                    false,
+                                panic!(
                                     "PostgreSQL pool connect failed: {} with user={}, password={}, but expect success",
                                     e, current_user, current_pwd
                                 );
@@ -345,24 +538,22 @@ impl RdbTestRunner {
                         );
                     }
                 }
-            } else {
-                if let Some(ref pool) = pg_pool {
-                    let query = sqlx::query(line);
-                    let result = query.execute(pool).await;
+            } else if let Some(ref pool) = pg_pool {
+                let query = sqlx::query(line);
+                let result = query.execute(pool).await;
 
-                    if expect_success {
-                        assert!(
-                            result.is_ok(),
-                            "Expected success but got error: {:?}",
-                            result.err()
-                        );
-                    } else {
-                        assert!(
-                            result.is_err(),
-                            "Expected error but got success, sql: {}",
-                            line
-                        );
-                    }
+                if expect_success {
+                    assert!(
+                        result.is_ok(),
+                        "Expected success but got error: {:?}",
+                        result.err()
+                    );
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "Expected error but got success, sql: {}",
+                        line
+                    );
                 }
             }
         }
@@ -378,6 +569,11 @@ impl RdbTestRunner {
     }
 
     pub async fn run_cdc_test(&self, start_millis: u64, parse_millis: u64) -> anyhow::Result<()> {
+        if self.mock_prepare_only {
+            self.execute_mock_prepare_only_sqls().await?;
+            return Ok(());
+        }
+
         // prepare src and dst tables
         self.execute_prepare_sqls().await?;
 
@@ -528,9 +724,7 @@ impl RdbTestRunner {
 
         // migrate database/table structures to target if needed
         if !self.base.struct_task_config_file.is_empty() {
-            TaskRunner::new(&self.base.struct_task_config_file)?
-                .start_task(BaseTestRunner::get_enable_log4rs())
-                .await?;
+            BaseTestRunner::start_task_with_config_file(&self.base.struct_task_config_file).await?;
         }
         Ok(())
     }
@@ -573,6 +767,17 @@ impl RdbTestRunner {
         dst_db_tbs: &[(String, String)],
     ) -> anyhow::Result<bool> {
         let filtered_db_tbs = self.get_filtered_db_tbs();
+        if self.unordered_compare && self.unordered_compare_threads > 1 {
+            let mut compare_pairs = Vec::new();
+            for i in 0..src_db_tbs.len() {
+                if filtered_db_tbs.contains(&src_db_tbs[i]) {
+                    continue;
+                }
+                compare_pairs.push((src_db_tbs[i].clone(), dst_db_tbs[i].clone()));
+            }
+            return self.compare_tb_data_pairs_parallel(compare_pairs).await;
+        }
+
         for i in 0..src_db_tbs.len() {
             if filtered_db_tbs.contains(&src_db_tbs[i]) {
                 continue;
@@ -588,6 +793,22 @@ impl RdbTestRunner {
         dst_db_tbs: &[(String, String)],
     ) -> anyhow::Result<bool> {
         let filtered_db_tbs = self.get_filtered_db_tbs();
+        if self.unordered_compare && self.unordered_compare_threads > 1 {
+            let mut compare_pairs = Vec::new();
+            for i in 0..src_db_tbs.len() {
+                if filtered_db_tbs.contains(&src_db_tbs[i]) {
+                    let dst_data = self.fetch_data(&dst_db_tbs[i], DST).await?;
+                    if !dst_data.is_empty() {
+                        println!("tb: {:?} is filtered but dst is not empty", dst_db_tbs[i]);
+                        panic!()
+                    }
+                } else {
+                    compare_pairs.push((src_db_tbs[i].clone(), dst_db_tbs[i].clone()));
+                }
+            }
+            return self.compare_tb_data_pairs_parallel(compare_pairs).await;
+        }
+
         for i in 0..src_db_tbs.len() {
             if filtered_db_tbs.contains(&src_db_tbs[i]) {
                 let dst_data = self.fetch_data(&dst_db_tbs[i], DST).await?;
@@ -597,6 +818,31 @@ impl RdbTestRunner {
                 }
             } else {
                 assert!(self.compare_tb_data(&src_db_tbs[i], &dst_db_tbs[i]).await?)
+            }
+        }
+        Ok(true)
+    }
+
+    async fn compare_tb_data_pairs_parallel(
+        &self,
+        compare_pairs: Vec<((String, String), (String, String))>,
+    ) -> anyhow::Result<bool> {
+        let semaphore = std::sync::Arc::new(Semaphore::new(self.unordered_compare_threads));
+        let mut handles = Vec::with_capacity(compare_pairs.len());
+
+        for (src_db_tb, dst_db_tb) in compare_pairs {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let runner = self.clone();
+            handles.push(tokio::spawn(async move {
+                let result = runner.compare_tb_data(&src_db_tb, &dst_db_tb).await;
+                drop(permit);
+                result
+            }));
+        }
+
+        for handle in handles {
+            if !handle.await?? {
+                return Ok(false);
             }
         }
         Ok(true)
@@ -633,18 +879,64 @@ impl RdbTestRunner {
         dst_data: &[RowData],
         src_db_tb: &(String, String),
     ) -> bool {
-        assert_eq!(src_data.len(), dst_data.len());
+        if src_data.len() != dst_data.len() {
+            println!(
+                "row count mismatch: src={}, dst={}",
+                src_data.len(),
+                dst_data.len()
+            );
+            return false;
+        }
+
         let src_db_type = self.get_db_type(SRC);
         let dst_db_type = self.get_db_type(DST);
 
         // router: col_map
-        let col_map = self.router.get_col_map(&src_db_tb.0, &src_db_tb.1);
+        let col_map = self
+            .router
+            .as_ref()
+            .and_then(|router| router.get_col_map(&src_db_tb.0, &src_db_tb.1));
         // filter: ignore_cols
         let ignore_cols = self.filter.get_ignore_cols(&src_db_tb.0, &src_db_tb.1);
 
+        if self.unordered_compare {
+            // Unordered comparison: use multiset matching for tables without primary key
+            self.compare_row_data_unordered(
+                src_data,
+                dst_data,
+                col_map,
+                ignore_cols,
+                &src_db_type,
+                &dst_db_type,
+            )
+        } else {
+            // Ordered comparison: compare rows by index
+            self.compare_row_data_ordered(
+                src_data,
+                dst_data,
+                col_map,
+                ignore_cols,
+                &src_db_type,
+                &dst_db_type,
+            )
+        }
+    }
+
+    fn compare_row_data_ordered(
+        &self,
+        src_data: &[RowData],
+        dst_data: &[RowData],
+        col_map: Option<&HashMap<String, String>>,
+        ignore_cols: Option<&HashSet<String>>,
+        src_db_type: &DbType,
+        dst_db_type: &DbType,
+    ) -> bool {
         for i in 0..src_data.len() {
-            let src_col_values = src_data[i].after.as_ref().unwrap();
-            let dst_col_values = dst_data[i].after.as_ref().unwrap();
+            let (src_col_values, dst_col_values) =
+                match (src_data[i].require_after(), dst_data[i].require_after()) {
+                    (Ok(src), Ok(dst)) => (src, dst),
+                    _ => return false,
+                };
 
             for (src_col, src_col_value) in src_col_values {
                 let dst_col = if let Some(col_map) = col_map {
@@ -661,26 +953,177 @@ impl RdbTestRunner {
                     continue;
                 }
 
-                // TODO
-                // issue: https://github.com/apecloud/foxlake/issues/2108
-                // sqlx will execute: "SET time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;"
-                // to initialize each connection.
-                // but it doesn't work on Foxlake
-                if matches!(self.base.get_config().sinker, SinkerConfig::Foxlake { .. })
-                    && matches!(dst_col_value, ColValue::Timestamp(..))
-                {
-                    continue;
-                }
-
                 println!(
                     "row index: {}, col: {}, src_col_value: {:?}, dst_col_value: {:?}",
                     i, src_col, src_col_value, dst_col_value
                 );
 
-                if Self::compare_col_value(src_col_value, dst_col_value, &src_db_type, &dst_db_type)
-                {
+                if Self::compare_col_value(src_col_value, dst_col_value, src_db_type, dst_db_type) {
                     continue;
                 }
+                return false;
+            }
+        }
+        true
+    }
+
+    // Unordered comparison: use multiset matching for tables without primary key
+    // or with NULL values in unique keys
+    fn compare_row_data_unordered(
+        &self,
+        src_data: &[RowData],
+        dst_data: &[RowData],
+        col_map: Option<&HashMap<String, String>>,
+        ignore_cols: Option<&HashSet<String>>,
+        src_db_type: &DbType,
+        dst_db_type: &DbType,
+    ) -> bool {
+        // Normalize rows to comparable strings and count occurrences
+        let mut dst_row_counts: HashMap<String, usize> = HashMap::new();
+
+        // Build destination row counts
+        for (i, row) in dst_data.iter().enumerate() {
+            let dst_col_values = match row.require_after() {
+                Ok(v) => v,
+                Err(_) => {
+                    println!("failed to get dst row {} after values", i);
+                    return false;
+                }
+            };
+
+            let row_key =
+                self.normalize_row(dst_col_values, col_map, ignore_cols, dst_db_type, false);
+            *dst_row_counts.entry(row_key).or_insert(0) += 1;
+        }
+
+        // Compare multisets using flexible column value comparison
+        // Try to match each src row to a dst row
+        let mut matched_dst_rows: HashMap<String, usize> = HashMap::new();
+
+        for (i, row) in src_data.iter().enumerate() {
+            let src_col_values = match row.require_after() {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+
+            // Try to find a matching row in dst_data
+            let mut found_match = false;
+            for dst_row in dst_data.iter() {
+                let dst_col_values = match dst_row.require_after() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                // Check how many times this dst row has been matched
+                let dst_key =
+                    self.normalize_row(dst_col_values, col_map, ignore_cols, dst_db_type, false);
+                let already_matched = *matched_dst_rows.get(&dst_key).unwrap_or(&0);
+                let dst_available = *dst_row_counts.get(&dst_key).unwrap_or(&0);
+
+                if already_matched >= dst_available {
+                    continue;
+                }
+
+                if self.compare_single_row(
+                    src_col_values,
+                    dst_col_values,
+                    col_map,
+                    ignore_cols,
+                    src_db_type,
+                    dst_db_type,
+                ) {
+                    *matched_dst_rows.entry(dst_key).or_insert(0) += 1;
+                    found_match = true;
+                    break;
+                }
+            }
+
+            if !found_match {
+                println!("no matching dst row found for src row {}", i);
+                // Print the src row for debugging
+                for (col, val) in src_col_values {
+                    println!("  src col: {}, value: {:?}", col, val);
+                }
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Normalize a row to a comparable string key
+    fn normalize_row(
+        &self,
+        col_values: &HashMap<String, ColValue>,
+        col_map: Option<&HashMap<String, String>>,
+        ignore_cols: Option<&HashSet<String>>,
+        _db_type: &DbType,
+        is_src: bool,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        // Get sorted column names for consistent ordering
+        let mut cols: Vec<&String> = col_values.keys().collect();
+        cols.sort();
+
+        for col in cols {
+            // Map column name if needed
+            let effective_col = if is_src {
+                if let Some(map) = col_map {
+                    map.get(col).unwrap_or(col)
+                } else {
+                    col
+                }
+            } else {
+                col
+            };
+
+            // Skip ignored columns
+            if is_src && ignore_cols.is_some_and(|cols| cols.contains(col)) {
+                continue;
+            }
+            if !is_src && ignore_cols.is_some_and(|cols| cols.contains(effective_col)) {
+                continue;
+            }
+
+            let val = col_values.get(col).unwrap();
+            parts.push(format!("{}={:?}", effective_col, val));
+        }
+
+        parts.join("|")
+    }
+
+    // Compare a single source row with a destination row
+    fn compare_single_row(
+        &self,
+        src_col_values: &HashMap<String, ColValue>,
+        dst_col_values: &HashMap<String, ColValue>,
+        col_map: Option<&HashMap<String, String>>,
+        ignore_cols: Option<&HashSet<String>>,
+        src_db_type: &DbType,
+        dst_db_type: &DbType,
+    ) -> bool {
+        for (src_col, src_col_value) in src_col_values {
+            let dst_col = if let Some(map) = col_map {
+                map.get(src_col).unwrap_or(src_col)
+            } else {
+                src_col
+            };
+
+            let dst_col_value = match dst_col_values.get(dst_col) {
+                Some(v) => v,
+                None => return false,
+            };
+
+            // ignored cols were NOT synced to target
+            if ignore_cols.is_some_and(|cols| cols.contains(src_col)) {
+                if *dst_col_value != ColValue::None {
+                    return false;
+                }
+                continue;
+            }
+
+            if !Self::compare_col_value(src_col_value, dst_col_value, src_db_type, dst_db_type) {
                 return false;
             }
         }
@@ -713,7 +1156,6 @@ impl RdbTestRunner {
         // for example: we use Year in mysql, but INT in StarRocks,
         // so try to compare after both converted to string.
         match src_col_value {
-            // mysql 00:00:00 == foxlake 00:00:00.000000
             ColValue::Time(_) => {
                 DtNaiveTime::from_str(&src_col_value.to_string()).unwrap()
                     == DtNaiveTime::from_str(&dst_col_value.to_string()).unwrap()
@@ -842,7 +1284,10 @@ impl RdbTestRunner {
 
         let mut dst_db_tbs = vec![];
         for (db, tb) in src_db_tbs.iter() {
-            let (dst_db, dst_tb) = self.router.get_tb_map(db, tb);
+            let (dst_db, dst_tb) = match &self.router {
+                Some(router) => router.get_tb_map(db, tb),
+                None => (db.as_str(), tb.as_str()),
+            };
             dst_db_tbs.push((dst_db.into(), dst_tb.into()));
         }
 
@@ -931,7 +1376,10 @@ impl RdbTestRunner {
         if from == SRC {
             config.extractor_basic.db_type
         } else {
-            config.sinker_basic.db_type
+            config
+                .destination_target()
+                .map(|target| target.db_type)
+                .unwrap_or(config.sinker_basic.db_type)
         }
     }
 
@@ -961,5 +1409,88 @@ impl RdbTestRunner {
         } else {
             format!("{} AND {}", res, condition)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TMP_CONFIG_SUFFIX: AtomicU64 = AtomicU64::new(0);
+
+    fn write_tmp_config(content: &str) -> String {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let counter = TMP_CONFIG_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        let path = format!(
+            "/tmp/dt_mock_compare_config_{}_{}_{}.ini",
+            std::process::id(),
+            suffix,
+            counter
+        );
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_load_mock_compare_config_defaults() {
+        let path = write_tmp_config("[mock]\n");
+        let (unordered_compare, configured, threads) =
+            RdbTestRunner::load_mock_compare_config(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(!unordered_compare);
+        assert!(!configured);
+        assert_eq!(threads, 1);
+    }
+
+    #[test]
+    fn test_load_mock_compare_config_values() {
+        let path =
+            write_tmp_config("[mock]\nunordered_compare=true\nunordered_compare_threads=4\n");
+        let (unordered_compare, configured, threads) =
+            RdbTestRunner::load_mock_compare_config(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(unordered_compare);
+        assert!(configured);
+        assert_eq!(threads, 4);
+    }
+
+    #[test]
+    fn test_load_mock_compare_config_unorder_alias() {
+        let path = write_tmp_config("[mock]\nunorder_compare=true\nunordered_compare_threads=0\n");
+        let (unordered_compare, configured, threads) =
+            RdbTestRunner::load_mock_compare_config(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(unordered_compare);
+        assert!(configured);
+        assert_eq!(threads, 1);
+    }
+
+    #[test]
+    fn test_load_mock_prepare_only_config() {
+        let path = write_tmp_config("[mock]\nprepare_only=true\n");
+        let prepare_only = RdbTestRunner::load_mock_prepare_only_config(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(prepare_only);
+    }
+
+    #[test]
+    fn test_load_mock_prepare_only_config_defaults() {
+        let path = write_tmp_config("[mock]\n");
+        let prepare_only = RdbTestRunner::load_mock_prepare_only_config(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(!prepare_only);
     }
 }

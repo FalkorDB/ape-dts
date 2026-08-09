@@ -3,11 +3,14 @@ use async_trait::async_trait;
 pub mod counter;
 pub mod counter_type;
 pub mod group_monitor;
+pub mod runtime_trace_monitor;
 pub mod task_metrics;
 pub mod task_monitor;
+pub mod task_monitor_handle;
 
 #[allow(clippy::module_inception)]
 pub mod monitor;
+pub mod sinker_worker_metrics;
 pub mod time_window_counter;
 
 #[cfg(feature = "metrics")]

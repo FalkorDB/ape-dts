@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 
-use dt_common::meta::mongo::{mongo_constant::MongoConstants, mongo_key::MongoKey};
+use dt_common::meta::mongo::{mongo_constant::MongoConstants, mongo_shard::list_shard_collections};
 use dt_common::{
     config::{
         config_enums::DbType, extractor_config::ExtractorConfig, sinker_config::SinkerConfig,
@@ -11,11 +13,10 @@ use dt_common::{
 use dt_connector::rdb_router::RdbRouter;
 use dt_task::task_util::TaskUtil;
 use mongodb::{
-    bson::{doc, Document},
-    options::FindOptions,
+    bson::{doc, oid::ObjectId, Bson, Document},
     Client,
 };
-use regex::Regex;
+use regex::{Captures, Regex};
 use sqlx::types::chrono::Utc;
 
 use crate::test_config_util::TestConfigUtil;
@@ -26,7 +27,7 @@ pub struct MongoTestRunner {
     pub base: BaseTestRunner,
     src_mongo_client: Option<Client>,
     dst_mongo_client: Option<Client>,
-    router: RdbRouter,
+    router: Option<RdbRouter>,
 }
 
 pub const SRC: &str = "src";
@@ -41,29 +42,105 @@ impl MongoTestRunner {
         let mut dst_mongo_client = None;
 
         let config = TaskConfig::new(&base.task_config_file).unwrap();
-        match config.extractor {
-            ExtractorConfig::MongoSnapshot { url, app_name, .. }
-            | ExtractorConfig::MongoCdc { url, app_name, .. }
-            | ExtractorConfig::MongoCheck { url, app_name, .. } => {
+        match &config.extractor {
+            ExtractorConfig::MongoSnapshot {
+                url,
+                connection_auth,
+                is_direct_connection,
+                app_name,
+                ..
+            }
+            | ExtractorConfig::MongoCdc {
+                url,
+                connection_auth,
+                is_direct_connection,
+                app_name,
+                ..
+            }
+            | ExtractorConfig::MongoCheck {
+                url,
+                connection_auth,
+                is_direct_connection,
+                app_name,
+                ..
+            }
+            | ExtractorConfig::MongoStruct {
+                url,
+                connection_auth,
+                is_direct_connection,
+                app_name,
+                ..
+            } => {
                 src_mongo_client = Some(
-                    TaskUtil::create_mongo_client(&url, &app_name)
-                        .await
-                        .unwrap(),
+                    TaskUtil::create_mongo_client(
+                        url,
+                        connection_auth,
+                        *is_direct_connection,
+                        Some(app_name.to_owned()),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
                 );
             }
             _ => {}
         }
 
-        match config.sinker {
-            SinkerConfig::Mongo { url, app_name, .. }
-            | SinkerConfig::MongoCheck { url, app_name, .. } => {
-                dst_mongo_client = Some(
-                    TaskUtil::create_mongo_client(&url, &app_name)
+        if let SinkerConfig::Mongo {
+            url,
+            connection_auth,
+            is_direct_connection,
+            app_name,
+            ..
+        }
+        | SinkerConfig::MongoStruct {
+            url,
+            connection_auth,
+            is_direct_connection,
+            app_name,
+            ..
+        } = &config.sinker
+        {
+            dst_mongo_client = Some(
+                TaskUtil::create_mongo_client(
+                    url,
+                    connection_auth,
+                    *is_direct_connection,
+                    Some(app_name.to_owned()),
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        if dst_mongo_client.is_none() {
+            if let Some(checker_target) = config.checker_target() {
+                if matches!(checker_target.db_type, DbType::Mongo) {
+                    dst_mongo_client = Some(
+                        TaskUtil::create_mongo_client(
+                            &checker_target.url,
+                            &checker_target.connection_auth,
+                            None,
+                            None,
+                            None,
+                        )
                         .await
                         .unwrap(),
-                );
+                    );
+                }
             }
-            _ => {}
+        }
+
+        // cleanup dbs before tests
+        let mongo_dbs = Self::collect_databases(&base);
+        if !mongo_dbs.is_empty() {
+            if let Some(client) = src_mongo_client.as_ref() {
+                Self::drop_databases(client, &mongo_dbs).await?;
+            }
+            if let Some(client) = dst_mongo_client.as_ref() {
+                Self::drop_databases(client, &mongo_dbs).await?;
+            }
         }
 
         let router = RdbRouter::from_config(&config.router, &DbType::Mongo).unwrap();
@@ -173,6 +250,54 @@ impl MongoTestRunner {
         self.base.abort_task(&task).await
     }
 
+    pub async fn run_changestream_ddl_test(
+        &self,
+        start_millis: u64,
+        parse_millis: u64,
+    ) -> anyhow::Result<()> {
+        self.execute_prepare_sqls().await?;
+        TimeUtil::sleep_millis(1200).await;
+
+        let task = self.base.spawn_task().await?;
+        TimeUtil::sleep_millis(start_millis).await;
+
+        self.execute_sqls_in_order_with_client(
+            self.src_mongo_client.as_ref().unwrap(),
+            &self.base.src_test_sqls,
+        )
+        .await?;
+        TimeUtil::sleep_millis(parse_millis).await;
+
+        self.assert_changestream_ddl_result().await?;
+        self.base.abort_task(&task).await
+    }
+
+    pub async fn run_cdc_in_order_test(
+        &self,
+        start_millis: u64,
+        parse_millis: u64,
+    ) -> anyhow::Result<()> {
+        self.execute_prepare_sqls().await?;
+        TimeUtil::sleep_millis(1200).await;
+
+        let task = self.base.spawn_task().await?;
+        TimeUtil::sleep_millis(start_millis).await;
+
+        self.execute_sqls_in_order_with_client(
+            self.src_mongo_client.as_ref().unwrap(),
+            &self.base.src_test_sqls,
+        )
+        .await?;
+        TimeUtil::sleep_millis(parse_millis).await;
+
+        let src_sqls = Self::slice_sqls_by_db(&self.base.src_test_sqls);
+        for (db, _) in src_sqls.iter() {
+            self.compare_db_data(db).await;
+        }
+
+        self.base.abort_task(&task).await
+    }
+
     pub async fn run_snapshot_test(&self, compare_data: bool) -> anyhow::Result<()> {
         self.execute_prepare_sqls().await?;
         self.execute_test_sqls().await?;
@@ -234,47 +359,149 @@ impl MongoTestRunner {
         Ok(())
     }
 
-    pub async fn execute_test_sqls(&self) -> anyhow::Result<()> {
-        let sqls = MongoTestRunner::slice_sqls_by_db(&self.base.src_test_sqls);
-        for (db, sqls) in sqls.iter() {
-            self.execute_dmls(self.src_mongo_client.as_ref().unwrap(), db, sqls)
-                .await
-                .unwrap();
-        }
+    pub async fn execute_clean_sqls(&self) -> anyhow::Result<()> {
+        let src_mongo_client = self.src_mongo_client.as_ref().unwrap();
+        let dst_mongo_client = self.dst_mongo_client.as_ref().unwrap();
 
-        let sqls = MongoTestRunner::slice_sqls_by_db(&self.base.dst_test_sqls);
-        for (db, sqls) in sqls.iter() {
-            self.execute_dmls(self.dst_mongo_client.as_ref().unwrap(), db, sqls)
-                .await
-                .unwrap();
+        let src_sqls = Self::slice_sqls_by_db(&self.base.src_clean_sqls);
+        let dst_sqls = Self::slice_sqls_by_db(&self.base.dst_clean_sqls);
+
+        for (db, sqls) in src_sqls.iter() {
+            self.execute_ddls(src_mongo_client, db, sqls).await?;
+            self.execute_dmls(src_mongo_client, db, sqls).await?;
+        }
+        for (db, sqls) in dst_sqls.iter() {
+            self.execute_ddls(dst_mongo_client, db, sqls).await?;
+            self.execute_dmls(dst_mongo_client, db, sqls).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn run_struct_test(&self) -> anyhow::Result<()> {
+        self.execute_prepare_sqls().await?;
+        self.base.start_task().await
+    }
+
+    pub fn src_mongo_client(&self) -> &Client {
+        self.src_mongo_client
+            .as_ref()
+            .expect("src_mongo_client is not initialized")
+    }
+
+    pub fn dst_mongo_client(&self) -> &Client {
+        self.dst_mongo_client
+            .as_ref()
+            .expect("dst_mongo_client is not initialized")
+    }
+
+    pub async fn execute_test_sqls(&self) -> anyhow::Result<()> {
+        self.execute_sqls_with_client(
+            self.src_mongo_client.as_ref().unwrap(),
+            &self.base.src_test_sqls,
+        )
+        .await?;
+        self.execute_sqls_with_client(
+            self.dst_mongo_client.as_ref().unwrap(),
+            &self.base.dst_test_sqls,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn execute_sqls_with_client(
+        &self,
+        client: &Client,
+        sqls: &[String],
+    ) -> anyhow::Result<()> {
+        let sliced_sqls = Self::slice_sqls_by_db(sqls);
+        for (db, sqls) in sliced_sqls.iter() {
+            self.execute_ddls(client, db, sqls).await?;
+            self.execute_dmls(client, db, sqls).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn execute_sqls_in_order_with_client(
+        &self,
+        client: &Client,
+        sqls: &[String],
+    ) -> anyhow::Result<()> {
+        let mut db = String::new();
+        for sql in sqls.iter() {
+            if sql.starts_with("use") {
+                db = Self::get_db(sql);
+                continue;
+            }
+
+            if self.execute_ddl_sql(client, &db, sql).await? {
+                continue;
+            }
+            self.execute_dml_sql(client, &db, sql).await?;
         }
         Ok(())
     }
 
     async fn execute_ddls(&self, client: &Client, db: &str, sqls: &[String]) -> anyhow::Result<()> {
         for sql in sqls.iter() {
-            if sql.contains("dropDatabase") {
-                self.execute_drop_database(client, db).await.unwrap();
-            } else if sql.contains("drop") {
-                self.execute_drop(client, db, sql).await.unwrap();
-            } else if sql.contains("createCollection") {
-                self.execute_create(client, db, sql).await.unwrap();
-            }
+            self.execute_ddl_sql(client, db, sql).await?;
         }
         Ok(())
     }
 
     async fn execute_dmls(&self, client: &Client, db: &str, sqls: &[String]) -> anyhow::Result<()> {
         for sql in sqls.iter() {
-            if sql.contains("insert") {
-                self.execute_insert(client, db, sql).await?;
-            }
-            if sql.contains("update") {
-                self.execute_update(client, db, sql).await?;
-            }
-            if sql.contains("delete") {
-                self.execute_delete(client, db, sql).await?;
-            }
+            self.execute_dml_sql(client, db, sql).await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_ddl_sql(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<bool> {
+        if sql.contains("admin.runCommand") {
+            self.execute_admin_run_command(client, sql).await.unwrap();
+            return Ok(true);
+        }
+        if sql.contains("dropDatabase") {
+            self.execute_drop_database(client, db).await.unwrap();
+            return Ok(true);
+        }
+        if sql.contains("renameCollection") {
+            self.execute_rename_collection(client, db, sql)
+                .await
+                .unwrap();
+            return Ok(true);
+        }
+        if sql.contains("runCommand") {
+            self.execute_run_command(client, db, sql).await.unwrap();
+            return Ok(true);
+        }
+        if sql.contains("createIndex") {
+            self.execute_create_index(client, db, sql).await.unwrap();
+            return Ok(true);
+        }
+        if sql.contains("dropIndex") {
+            self.execute_drop_index(client, db, sql).await.unwrap();
+            return Ok(true);
+        }
+        if sql.contains(".drop()") {
+            self.execute_drop(client, db, sql).await.unwrap();
+            return Ok(true);
+        }
+        if sql.contains("createCollection") {
+            self.execute_create(client, db, sql).await.unwrap();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn execute_dml_sql(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
+        if sql.contains(".insert") {
+            self.execute_insert(client, db, sql).await?;
+        } else if sql.contains(".update") {
+            self.execute_update(client, db, sql).await?;
+        } else if sql.contains(".replace") {
+            self.execute_replace(client, db, sql).await?;
+        } else if sql.contains(".delete") {
+            self.execute_delete(client, db, sql).await?;
         }
         Ok(())
     }
@@ -286,87 +513,313 @@ impl MongoTestRunner {
     }
 
     async fn execute_drop(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
-        let re = Regex::new(r"db.(\w+).drop()").unwrap();
+        let re = Regex::new(r"db\.(\w+)\.drop\(\)").unwrap();
         let cap = re.captures(sql).unwrap();
         let tb = cap.get(1).unwrap().as_str();
 
         client
             .database(db)
             .collection::<Document>(tb)
-            .drop(None)
+            .drop()
             .await
             .unwrap();
         Ok(())
     }
 
     async fn execute_drop_database(&self, client: &Client, db: &str) -> anyhow::Result<()> {
-        client.database(db).drop(None).await.unwrap();
+        client.database(db).drop().await.unwrap();
         Ok(())
     }
 
     async fn execute_create(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
-        let re = Regex::new(r#"db.createCollection\("(\w+)"\)"#).unwrap();
+        let re = Regex::new(r#"db.createCollection\("(\w+)"(?:\s*,\s*([\w\W]+))?\)"#).unwrap();
         let cap = re.captures(sql).unwrap();
         let tb = cap.get(1).unwrap().as_str();
 
+        let mut command = doc! { "create": tb };
+        if let Some(options) = cap.get(2) {
+            let options = Self::parse_doc(options.as_str());
+            for (key, value) in options {
+                command.insert(key, value);
+            }
+        }
+
+        client.database(db).run_command(command).await.unwrap();
+        Ok(())
+    }
+
+    async fn execute_admin_run_command(&self, client: &Client, sql: &str) -> anyhow::Result<()> {
+        let re = Regex::new(r"admin\.runCommand\(([\w\W]+)\)").unwrap();
+        let cap = re.captures(sql).unwrap();
+        let command = Self::parse_doc(cap.get(1).unwrap().as_str());
+
+        client.database("admin").run_command(command).await.unwrap();
+        Ok(())
+    }
+
+    async fn execute_create_index(
+        &self,
+        client: &Client,
+        db: &str,
+        sql: &str,
+    ) -> anyhow::Result<()> {
+        let re = Regex::new(r"db\.(\w+)\.createIndex\(([\w\W]+)\)").unwrap();
+        let cap = re.captures(sql).unwrap();
+        let tb = cap.get(1).unwrap().as_str();
+        let args = Self::split_top_level_args(cap.get(2).unwrap().as_str());
+        let key = Self::parse_doc(&args[0]);
+        let options = if args.len() > 1 {
+            Self::parse_doc(&args[1])
+        } else {
+            Document::new()
+        };
+        let name = options
+            .get_str("name")
+            .map(str::to_string)
+            .unwrap_or_else(|_| {
+                key.iter()
+                    .map(|(key, value)| format!("{}_{}", key, value))
+                    .collect::<Vec<_>>()
+                    .join("_")
+            });
+
+        let mut index = doc! { "key": key, "name": name };
+        for (key, value) in options {
+            if key != "name" {
+                index.insert(key, value);
+            }
+        }
+
         client
             .database(db)
-            .create_collection(tb, None)
+            .run_command(doc! { "createIndexes": tb, "indexes": [index] })
             .await
             .unwrap();
         Ok(())
     }
 
-    async fn execute_insert(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
-        // example: db.tb_2.insertOne({ "name": "a", "age": "1" })
-        let re = Regex::new(r"db.(\w+).insert(One|Many)\(([\w\W]+)\)").unwrap();
+    async fn execute_drop_index(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
+        let re = Regex::new(r#"db\.(\w+)\.dropIndex\("([^"]+)"\)"#).unwrap();
         let cap = re.captures(sql).unwrap();
         let tb = cap.get(1).unwrap().as_str();
-        let doc_content = cap.get(3).unwrap().as_str();
+        let index = cap.get(2).unwrap().as_str();
+
+        client
+            .database(db)
+            .run_command(doc! { "dropIndexes": tb, "index": index })
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    async fn execute_rename_collection(
+        &self,
+        client: &Client,
+        db: &str,
+        sql: &str,
+    ) -> anyhow::Result<()> {
+        let re = Regex::new(r#"db\.(\w+)\.renameCollection\("(\w+)"\)"#).unwrap();
+        let cap = re.captures(sql).unwrap();
+        let from = cap.get(1).unwrap().as_str();
+        let to = cap.get(2).unwrap().as_str();
+
+        client
+            .database("admin")
+            .run_command(doc! { "renameCollection": format!("{}.{}", db, from), "to": format!("{}.{}", db, to) })
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    async fn execute_run_command(
+        &self,
+        client: &Client,
+        db: &str,
+        sql: &str,
+    ) -> anyhow::Result<()> {
+        let re = Regex::new(r"db.runCommand\(([\w\W]+)\)").unwrap();
+        let cap = re.captures(sql).unwrap();
+        let command = Self::parse_doc(cap.get(1).unwrap().as_str());
+
+        client.database(db).run_command(command).await.unwrap();
+        Ok(())
+    }
+
+    async fn execute_insert(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
+        // example: db.tb_2.insertOne({ "name": "a", "age": "1" })
+        let re = Regex::new(r"db\.(\w+)\.insert(One|Many)").unwrap();
+        let cap = re.captures(sql).unwrap();
+        let tb = cap.get(1).unwrap().as_str();
+        let is_insert_one = sql.contains(".insertOne(");
+        let is_insert_many = sql.contains(".insertMany(");
+        let args_start = sql.find('(').unwrap();
+        let args_end = sql.rfind(')').unwrap();
+        let args = &sql[args_start + 1..args_end];
+        let args = Self::split_top_level_args(args);
+        let doc_content = Self::normalize_doc_string(&args.first().cloned().unwrap_or_default());
 
         let coll = client.database(db).collection::<Document>(tb);
-        if sql.contains("insertOne") {
-            let doc: Document = serde_json::from_str(doc_content).unwrap();
-            coll.insert_one(doc, None).await.unwrap();
+        let json_value: Value = serde_json::from_str(&doc_content).unwrap();
+        let parsed = Self::convert_extended_json(Bson::try_from(json_value).unwrap());
+        if is_insert_one && !is_insert_many {
+            let doc = match parsed {
+                Bson::Document(doc) => doc,
+                other => panic!(
+                    "expected document for insertOne, got {:?}, sql: {}",
+                    other, sql
+                ),
+            };
+            coll.insert_one(doc).await.unwrap();
         } else {
-            let docs: Vec<Document> = serde_json::from_str(doc_content).unwrap();
-            coll.insert_many(docs, None).await.unwrap();
+            let docs = match parsed {
+                Bson::Array(arr) => arr
+                    .into_iter()
+                    .map(|item| match item {
+                        Bson::Document(doc) => doc,
+                        other => panic!("expected document inside array, got {:?}", other),
+                    })
+                    .collect::<Vec<Document>>(),
+                other => panic!(
+                    "expected array for insertMany, got {:?}, sql: {}",
+                    other, sql
+                ),
+            };
+            coll.insert_many(docs).await.unwrap();
         }
         Ok(())
     }
 
     async fn execute_delete(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
-        let re = Regex::new(r"db.(\w+).delete(One|Many)\(([\w\W]+)\)").unwrap();
+        let re = Regex::new(r"db\.(\w+)\.delete(One|Many)\(([\w\W]+)\)").unwrap();
         let cap = re.captures(sql).unwrap();
         let tb = cap.get(1).unwrap().as_str();
         let doc = cap.get(3).unwrap().as_str();
-
-        let doc: Document = serde_json::from_str(doc).unwrap();
+        let normalized_doc = Self::normalize_doc_string(doc);
+        let json_value: Value = serde_json::from_str(&normalized_doc).unwrap();
+        let parsed = Self::convert_extended_json(Bson::try_from(json_value).unwrap());
+        let doc = match parsed {
+            Bson::Document(doc) => doc,
+            other => panic!("expected document for delete, got {:?}", other),
+        };
         let coll = client.database(db).collection::<Document>(tb);
         if sql.contains("deleteOne") {
-            coll.delete_one(doc, None).await.unwrap();
+            coll.delete_one(doc).await.unwrap();
         } else {
-            coll.delete_many(doc, None).await.unwrap();
+            coll.delete_many(doc).await.unwrap();
         }
         Ok(())
     }
 
     async fn execute_update(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
-        let re = Regex::new(r"db.(\w+).update(One|Many)\(([\w\W]+),([\w\W]+)\)").unwrap();
-        let cap = re.captures(sql).unwrap();
+        let re = Regex::new(r"db\.(\w+)\.update(One|Many)").unwrap();
+        let cap = match re.captures(sql) {
+            Some(cap) => cap,
+            None => return Ok(()),
+        };
         let tb = cap.get(1).unwrap().as_str();
-        let query_doc = cap.get(3).unwrap().as_str();
-        let update_doc = cap.get(4).unwrap().as_str();
-
-        let query_doc: Document = serde_json::from_str(query_doc).unwrap();
-        let update_doc: Document = serde_json::from_str(update_doc).unwrap();
+        let args_start = sql.find('(').unwrap();
+        let args_end = sql.rfind(')').unwrap();
+        let args = &sql[args_start + 1..args_end];
+        let (query_doc, update_doc) = Self::split_update_args(args);
+        let normalized_query = Self::normalize_doc_string(&query_doc);
+        let normalized_update = Self::normalize_doc_string(&update_doc);
+        let json_query: Value = serde_json::from_str(&normalized_query).unwrap();
+        let json_update: Value = serde_json::from_str(&normalized_update).unwrap();
+        let parsed_query = Self::convert_extended_json(Bson::try_from(json_query).unwrap());
+        let parsed_update = Self::convert_extended_json(Bson::try_from(json_update).unwrap());
+        let query_doc = match parsed_query {
+            Bson::Document(doc) => doc,
+            other => panic!("expected document for update query, got {:?}", other),
+        };
+        let update_doc = match parsed_update {
+            Bson::Document(doc) => doc,
+            other => panic!("expected document for update update, got {:?}", other),
+        };
         let coll = client.database(db).collection::<Document>(tb);
         if sql.contains("updateOne") {
-            coll.update_one(query_doc, update_doc, None).await.unwrap();
+            coll.update_one(query_doc, update_doc).await.unwrap();
         } else {
-            coll.update_many(query_doc, update_doc, None).await.unwrap();
+            coll.update_many(query_doc, update_doc).await.unwrap();
         }
         Ok(())
+    }
+
+    async fn execute_replace(&self, client: &Client, db: &str, sql: &str) -> anyhow::Result<()> {
+        let re = Regex::new(r"db\.(\w+)\.replaceOne").unwrap();
+        let cap = match re.captures(sql) {
+            Some(cap) => cap,
+            None => return Ok(()),
+        };
+        let tb = cap.get(1).unwrap().as_str();
+        let args_start = sql.find('(').unwrap();
+        let args_end = sql.rfind(')').unwrap();
+        let args = &sql[args_start + 1..args_end];
+        let args = Self::split_top_level_args(args);
+        let query_doc = args.first().cloned().unwrap_or_default();
+        let replacement_doc = args.get(1).cloned().unwrap_or_default();
+        let normalized_query = Self::normalize_doc_string(&query_doc);
+        let normalized_replacement = Self::normalize_doc_string(&replacement_doc);
+        let json_query: Value = serde_json::from_str(&normalized_query).unwrap();
+        let json_replacement: Value = serde_json::from_str(&normalized_replacement).unwrap();
+        let parsed_query = Self::convert_extended_json(Bson::try_from(json_query).unwrap());
+        let parsed_replacement =
+            Self::convert_extended_json(Bson::try_from(json_replacement).unwrap());
+        let query_doc = match parsed_query {
+            Bson::Document(doc) => doc,
+            other => panic!("expected document for replace query, got {:?}", other),
+        };
+        let replacement_doc = match parsed_replacement {
+            Bson::Document(doc) => doc,
+            other => panic!("expected document for replace replacement, got {:?}", other),
+        };
+        let coll = client.database(db).collection::<Document>(tb);
+        coll.replace_one(query_doc, replacement_doc).await.unwrap();
+        Ok(())
+    }
+
+    fn split_update_args(args: &str) -> (String, String) {
+        let args = Self::split_top_level_args(args);
+        let query = args.first().cloned().unwrap_or_default();
+        let update = args.get(1).cloned().unwrap_or_default();
+        (query, update)
+    }
+
+    fn split_top_level_args(args: &str) -> Vec<String> {
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut start = 0;
+        let mut result = Vec::new();
+        for (idx, ch) in args.char_indices() {
+            if in_string {
+                escaped = ch == '\\' && !escaped;
+                if ch == '"' && !escaped {
+                    in_string = false;
+                } else if ch != '\\' {
+                    escaped = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' | '[' | '(' => depth += 1,
+                '}' | ']' | ')' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                ',' if depth == 0 => {
+                    result.push(args[start..idx].trim().to_string());
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        if start < args.len() {
+            result.push(args[start..].trim().to_string());
+        }
+        result
     }
 
     async fn compare_db_data(&self, db: &str) {
@@ -380,7 +833,10 @@ impl MongoTestRunner {
         println!("compare tb data, db: {}, tb: {}", db, tb);
         let src_data = self.fetch_data(db, tb, SRC).await;
 
-        let (dst_db, dst_tb) = self.router.get_tb_map(db, tb);
+        let (dst_db, dst_tb) = match &self.router {
+            Some(router) => router.get_tb_map(db, tb),
+            None => (db, tb),
+        };
         let dst_data = self.fetch_data(dst_db, dst_tb, DST).await;
 
         assert_eq!(src_data.len(), dst_data.len());
@@ -395,20 +851,16 @@ impl MongoTestRunner {
         }
     }
 
-    pub async fn list_tb(&self, db: &str, from: &str) -> Vec<String> {
+    async fn list_tb(&self, db: &str, from: &str) -> Vec<String> {
         let client = if from == SRC {
             self.src_mongo_client.as_ref().unwrap()
         } else {
             self.dst_mongo_client.as_ref().unwrap()
         };
-        client
-            .database(db)
-            .list_collection_names(None)
-            .await
-            .unwrap()
+        client.database(db).list_collection_names().await.unwrap()
     }
 
-    pub async fn fetch_data(&self, db: &str, tb: &str, from: &str) -> HashMap<MongoKey, Document> {
+    pub async fn fetch_data(&self, db: &str, tb: &str, from: &str) -> HashMap<String, Document> {
         let client = if from == SRC {
             self.src_mongo_client.as_ref().unwrap()
         } else {
@@ -416,18 +868,401 @@ impl MongoTestRunner {
         };
 
         let collection = client.database(db).collection::<Document>(tb);
-        let find_options = FindOptions::builder()
+        let mut cursor = collection
+            .find(doc! {})
             .sort(doc! {MongoConstants::ID: 1})
-            .build();
-        let mut cursor = collection.find(None, find_options).await.unwrap();
+            .await
+            .unwrap();
 
         let mut results = HashMap::new();
         while cursor.advance().await.unwrap() {
             let doc = cursor.deserialize_current().unwrap();
-            let id = MongoKey::from_doc(&doc).unwrap();
+            let id = Self::doc_id_key(&doc);
             results.insert(id, doc);
         }
         results
+    }
+
+    pub async fn assert_dst_shard_collection(&self, ns: &str, key: Document, unique: bool) {
+        let dst = self.dst_mongo_client.as_ref().unwrap();
+        let (is_mongos, shard_collections) = list_shard_collections(dst).await.unwrap();
+        assert!(is_mongos, "dst should be mongos for sharding assertions");
+        let shard_collection = shard_collections
+            .get(ns)
+            .unwrap_or_else(|| panic!("dst shard collection [{}] should exist", ns));
+        assert_eq!(shard_collection.key, key, "dst shard key mismatch: {}", ns);
+        assert_eq!(
+            shard_collection.unique, unique,
+            "dst shard unique mismatch: {}",
+            ns
+        );
+    }
+
+    pub async fn assert_dst_routed_shard_collection(
+        &self,
+        db: &str,
+        tb: &str,
+        key: Document,
+        unique: bool,
+    ) {
+        let (dst_db, dst_tb) = self.route_tb(db, tb);
+        self.assert_dst_shard_collection(&format!("{}.{}", dst_db, dst_tb), key, unique)
+            .await;
+    }
+
+    pub async fn assert_dst_collection_exists(&self, db: &str, tb: &str) {
+        let dst = self.dst_mongo_client.as_ref().unwrap();
+        let collections = dst.database(db).list_collection_names().await.unwrap();
+        assert!(
+            collections.contains(&tb.to_string()),
+            "dst collection [{}].[{}] should exist, collections: {:?}",
+            db,
+            tb,
+            collections
+        );
+    }
+
+    pub async fn assert_dst_collection_not_exists(&self, db: &str, tb: &str) {
+        let dst = self.dst_mongo_client.as_ref().unwrap();
+        let collections = dst.database(db).list_collection_names().await.unwrap();
+        assert!(
+            !collections.contains(&tb.to_string()),
+            "dst collection [{}].[{}] should not exist",
+            db,
+            tb
+        );
+    }
+
+    pub async fn assert_dst_routed_collection_exists(&self, db: &str, tb: &str) {
+        let (dst_db, dst_tb) = self.route_tb(db, tb);
+        self.assert_dst_collection_exists(&dst_db, &dst_tb).await;
+    }
+
+    pub async fn assert_dst_index_exists(
+        &self,
+        db: &str,
+        tb: &str,
+        index_name: &str,
+        key: Document,
+    ) {
+        let index = self.dst_index_doc(db, tb, index_name).await;
+        let index_key = index.get_document("key").unwrap();
+        assert_eq!(index_key, &key, "dst index key mismatch: {}", index_name);
+    }
+
+    pub async fn assert_dst_index_not_exists(&self, db: &str, tb: &str, index_name: &str) {
+        let indexes = self.dst_index_docs(db, tb).await;
+        assert!(
+            indexes
+                .iter()
+                .all(|index| index.get_str("name").ok() != Some(index_name)),
+            "dst index [{}] should not exist on {}.{}, indexes: {:?}",
+            index_name,
+            db,
+            tb,
+            indexes
+        );
+    }
+
+    pub async fn assert_dst_index_option_bool(
+        &self,
+        db: &str,
+        tb: &str,
+        index_name: &str,
+        option: &str,
+        expected: bool,
+    ) {
+        let index = self.dst_index_doc(db, tb, index_name).await;
+        assert_eq!(
+            index.get_bool(option).ok(),
+            Some(expected),
+            "dst index option [{}] mismatch for {}.{} index {}: {:?}",
+            option,
+            db,
+            tb,
+            index_name,
+            index
+        );
+    }
+
+    pub async fn assert_dst_index_option_i32(
+        &self,
+        db: &str,
+        tb: &str,
+        index_name: &str,
+        option: &str,
+        expected: i32,
+    ) {
+        let index = self.dst_index_doc(db, tb, index_name).await;
+        assert_eq!(
+            index.get_i32(option).ok(),
+            Some(expected),
+            "dst index option [{}] mismatch for {}.{} index {}: {:?}",
+            option,
+            db,
+            tb,
+            index_name,
+            index
+        );
+    }
+
+    pub async fn assert_dst_index_option_doc(
+        &self,
+        db: &str,
+        tb: &str,
+        index_name: &str,
+        option: &str,
+        expected: Document,
+    ) {
+        let index = self.dst_index_doc(db, tb, index_name).await;
+        let value = index.get_document(option).unwrap();
+        assert_eq!(
+            value, &expected,
+            "dst index option [{}] mismatch for {}.{} index {}",
+            option, db, tb, index_name
+        );
+    }
+
+    pub async fn assert_dst_index_option_doc_contains(
+        &self,
+        db: &str,
+        tb: &str,
+        index_name: &str,
+        option: &str,
+        expected: Document,
+    ) {
+        let index = self.dst_index_doc(db, tb, index_name).await;
+        let value = index.get_document(option).unwrap();
+        assert!(
+            Self::document_contains(value, &expected),
+            "dst index option [{}] for {}.{} index {} should contain {:?}, actual: {:?}",
+            option,
+            db,
+            tb,
+            index_name,
+            expected,
+            value
+        );
+    }
+
+    pub async fn assert_dst_collection_option_bool(
+        &self,
+        db: &str,
+        tb: &str,
+        option: &str,
+        expected: bool,
+    ) {
+        let options = self.dst_collection_options(db, tb).await;
+        assert_eq!(
+            options.get_bool(option).ok(),
+            Some(expected),
+            "dst collection option [{}] mismatch for {}.{}: {:?}",
+            option,
+            db,
+            tb,
+            options
+        );
+    }
+
+    pub async fn assert_dst_collection_option_str(
+        &self,
+        db: &str,
+        tb: &str,
+        option: &str,
+        expected: &str,
+    ) {
+        let options = self.dst_collection_options(db, tb).await;
+        assert_eq!(
+            options.get_str(option).ok(),
+            Some(expected),
+            "dst collection option [{}] mismatch for {}.{}: {:?}",
+            option,
+            db,
+            tb,
+            options
+        );
+    }
+
+    pub async fn assert_dst_collection_option_doc(
+        &self,
+        db: &str,
+        tb: &str,
+        option: &str,
+        expected: Document,
+    ) {
+        let options = self.dst_collection_options(db, tb).await;
+        let value = options.get_document(option).unwrap();
+        assert_eq!(
+            value, &expected,
+            "dst collection option [{}] mismatch for {}.{}",
+            option, db, tb
+        );
+    }
+
+    pub async fn assert_dst_collection_option_doc_contains(
+        &self,
+        db: &str,
+        tb: &str,
+        option: &str,
+        expected: Document,
+    ) {
+        let options = self.dst_collection_options(db, tb).await;
+        let value = options.get_document(option).unwrap();
+        assert!(
+            Self::document_contains(value, &expected),
+            "dst collection option [{}] for {}.{} should contain {:?}, actual: {:?}",
+            option,
+            db,
+            tb,
+            expected,
+            value
+        );
+    }
+
+    async fn dst_index_doc(&self, db: &str, tb: &str, index_name: &str) -> Document {
+        self.dst_index_docs(db, tb)
+            .await
+            .into_iter()
+            .find(|index| index.get_str("name").ok() == Some(index_name))
+            .unwrap_or_else(|| panic!("dst index [{}] should exist on {}.{}", index_name, db, tb))
+    }
+
+    async fn dst_index_docs(&self, db: &str, tb: &str) -> Vec<Document> {
+        let dst = self.dst_mongo_client.as_ref().unwrap();
+        let response = dst
+            .database(db)
+            .run_command(doc! { "listIndexes": tb })
+            .await
+            .unwrap();
+        response
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .iter()
+            .map(|index| index.as_document().unwrap().clone())
+            .collect()
+    }
+
+    async fn dst_collection_options(&self, db: &str, tb: &str) -> Document {
+        let dst = self.dst_mongo_client.as_ref().unwrap();
+        let response = dst
+            .database(db)
+            .run_command(doc! {
+                "listCollections": 1,
+                "filter": { "name": tb },
+            })
+            .await
+            .unwrap();
+        let first_batch = response
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        let collection = first_batch
+            .first()
+            .unwrap_or_else(|| panic!("dst collection [{}].[{}] should exist", db, tb))
+            .as_document()
+            .unwrap();
+        collection
+            .get_document("options")
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn route_tb(&self, db: &str, tb: &str) -> (String, String) {
+        self.router
+            .as_ref()
+            .map(|router| {
+                let (dst_db, dst_tb) = router.get_tb_map(db, tb);
+                (dst_db.to_string(), dst_tb.to_string())
+            })
+            .unwrap_or_else(|| (db.to_string(), tb.to_string()))
+    }
+
+    fn document_contains(actual: &Document, expected: &Document) -> bool {
+        expected.iter().all(|(key, expected_value)| {
+            let Some(actual_value) = actual.get(key) else {
+                return false;
+            };
+            match (actual_value, expected_value) {
+                (Bson::Document(actual_doc), Bson::Document(expected_doc)) => {
+                    Self::document_contains(actual_doc, expected_doc)
+                }
+                _ => actual_value == expected_value,
+            }
+        })
+    }
+
+    async fn assert_changestream_ddl_result(&self) -> anyhow::Result<()> {
+        let dst = self.dst_mongo_client.as_ref().unwrap();
+        let ddl_db = dst.database("ddl_db");
+        let collection_names = ddl_db.list_collection_names().await.unwrap();
+        assert!(collection_names.contains(&"created_coll".to_string()));
+        assert!(collection_names.contains(&"renamed_coll".to_string()));
+        assert!(!collection_names.contains(&"rename_me".to_string()));
+        assert!(!collection_names.contains(&"dropped_coll".to_string()));
+        assert!(!collection_names.contains(&"ignored_coll".to_string()));
+
+        let renamed_data = self.fetch_data("ddl_db", "renamed_coll", DST).await;
+        assert_eq!(renamed_data.len(), 1);
+        let renamed_doc = renamed_data
+            .values()
+            .find(|doc| doc.get_str(MongoConstants::ID).ok() == Some("renamed_doc"))
+            .expect("renamed_doc should exist");
+        assert_eq!(
+            renamed_doc.get_str("name").unwrap(),
+            "replaced_after_rename"
+        );
+        assert_eq!(
+            renamed_doc
+                .get_document("profile")
+                .unwrap()
+                .get_str("state")
+                .unwrap(),
+            "replaced_after_rename"
+        );
+
+        let created_data = self.fetch_data("ddl_db", "created_coll", DST).await;
+        assert_eq!(created_data.len(), 2);
+        let created_doc = created_data
+            .values()
+            .find(|doc| doc.get_str(MongoConstants::ID).ok() == Some("created_doc"))
+            .expect("created_doc should exist");
+        assert_eq!(
+            created_doc
+                .get_document("profile")
+                .unwrap()
+                .get_str("state")
+                .unwrap(),
+            "updated_after_create"
+        );
+        assert_eq!(
+            created_doc.get_array("attrs").unwrap(),
+            &vec![
+                Bson::String("seed".to_string()),
+                Bson::String("after_update".to_string())
+            ]
+        );
+
+        assert!(dst
+            .database("ddl_drop_db")
+            .list_collection_names()
+            .await
+            .unwrap()
+            .is_empty());
+        Ok(())
+    }
+
+    fn doc_id_key(doc: &Document) -> String {
+        let id = doc.get(MongoConstants::ID).unwrap_or_else(|| {
+            panic!(
+                "Mongo document missing `_id`, doc: {}",
+                Bson::Document(doc.clone()).into_canonical_extjson()
+            )
+        });
+        // use canonical extended JSON to ensure consistent representation of the _id value.
+        id.clone().into_canonical_extjson().to_string()
     }
 
     fn slice_sqls_by_db(sqls: &[String]) -> HashMap<String, Vec<String>> {
@@ -453,16 +1288,131 @@ impl MongoTestRunner {
         let mut update_sqls = Vec::new();
         let mut delete_sqls = Vec::new();
         for sql in sqls.iter() {
-            if sql.contains("insert") {
+            if sql.contains(".insert") {
                 insert_sqls.push(sql.clone());
             }
-            if sql.contains("update") {
+            if sql.contains(".update") || sql.contains(".replace") {
                 update_sqls.push(sql.clone());
             }
-            if sql.contains("delete") {
+            if sql.contains(".delete") {
                 delete_sqls.push(sql.clone());
             }
         }
         (insert_sqls, update_sqls, delete_sqls)
+    }
+
+    fn collect_databases(base: &BaseTestRunner) -> HashSet<String> {
+        let mut dbs = HashSet::new();
+        let sections = [
+            &base.src_prepare_sqls,
+            &base.dst_prepare_sqls,
+            &base.src_test_sqls,
+            &base.dst_test_sqls,
+            &base.src_clean_sqls,
+            &base.dst_clean_sqls,
+        ];
+        for sqls in sections.iter() {
+            Self::add_dbs_from_sqls(sqls, &mut dbs);
+        }
+        dbs
+    }
+
+    fn add_dbs_from_sqls(sqls: &[String], dbs: &mut HashSet<String>) {
+        for sql in sqls.iter() {
+            if sql.trim_start().starts_with("use ") {
+                let db = Self::get_db(sql);
+                if !db.is_empty() {
+                    dbs.insert(db);
+                }
+            }
+        }
+    }
+
+    async fn drop_databases(client: &Client, dbs: &HashSet<String>) -> anyhow::Result<()> {
+        for db in dbs.iter() {
+            if db.is_empty() {
+                continue;
+            }
+            client.database(db).drop().await?;
+        }
+        Ok(())
+    }
+
+    fn normalize_doc_string(doc: &str) -> String {
+        let oid_re = Regex::new(r#"ObjectId\("([a-fA-F0-9]{24})"\)"#).unwrap();
+        let doc = oid_re.replace_all(doc, r#"{"$$oid":"$1"}"#).to_string();
+        let number_long_re = Regex::new(r#"NumberLong\(\s*"?(-?\d+)"?\s*\)"#).unwrap();
+        let doc = number_long_re.replace_all(&doc, "$1").to_string();
+
+        let re =
+            Regex::new(r"(?P<prefix>[\{\[,]\s*)(?P<key>[$A-Za-z_][A-Za-z0-9_$]*)\s*:").unwrap();
+        re.replace_all(&doc, |caps: &Captures| {
+            format!("{}\"{}\":", &caps["prefix"], &caps["key"])
+        })
+        .to_string()
+    }
+
+    fn parse_doc(doc: &str) -> Document {
+        let normalized_doc = Self::normalize_doc_string(doc);
+        let json_value: Value = serde_json::from_str(&normalized_doc).unwrap();
+        match Self::convert_extended_json(Bson::try_from(json_value).unwrap()) {
+            Bson::Document(doc) => doc,
+            other => panic!("expected document, got {:?}", other),
+        }
+    }
+
+    fn convert_extended_json(value: Bson) -> Bson {
+        match value {
+            Bson::Document(doc) => {
+                if doc.len() == 1 {
+                    if let Some(Bson::String(s)) = doc.get("$oid") {
+                        if let Ok(oid) = ObjectId::parse_str(s) {
+                            return Bson::ObjectId(oid);
+                        }
+                    }
+                }
+                let mut normalized = Document::new();
+                for (k, v) in doc.into_iter() {
+                    normalized.insert(k, Self::convert_extended_json(v));
+                }
+                Bson::Document(normalized)
+            }
+            Bson::Array(arr) => Bson::Array(
+                arr.into_iter()
+                    .map(Self::convert_extended_json)
+                    .collect::<Vec<Bson>>(),
+            ),
+            other => other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MongoTestRunner;
+    use serde_json::Value;
+
+    #[test]
+    fn normalize_doc_string_quotes_dollar_prefixed_keys() {
+        let doc = r#"{ $set: { name: "a" }, age: 1 }"#;
+        let normalized = MongoTestRunner::normalize_doc_string(doc);
+        assert_eq!(normalized, r#"{ "$set": { "name": "a" }, "age": 1 }"#);
+        serde_json::from_str::<Value>(&normalized).unwrap();
+    }
+
+    #[test]
+    fn normalize_doc_string_leaves_quoted_keys_untouched() {
+        let doc = r#"{ "$inc": { "count": 1 } }"#;
+        let normalized = MongoTestRunner::normalize_doc_string(doc);
+        assert_eq!(normalized, doc);
+        serde_json::from_str::<Value>(&normalized).unwrap();
+    }
+
+    #[test]
+    fn normalize_doc_string_normalizes_numberlong_literal() {
+        let doc = r#"{ _id: NumberLong(9999999), value: NumberLong("123") }"#;
+        let normalized = MongoTestRunner::normalize_doc_string(doc);
+        assert_eq!(normalized, r#"{ "_id": 9999999, "value": 123 }"#);
+        serde_json::from_str::<Value>(&normalized).unwrap();
     }
 }

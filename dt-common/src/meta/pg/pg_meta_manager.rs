@@ -1,7 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{error::Error, meta::ddl_meta::ddl_data::DdlData};
-use anyhow::{bail, Context};
+use crate::{
+    config::config_enums::DbType,
+    error::{DtError, DtErrorContextExt, ErrorObject},
+    meta::{ddl_meta::ddl_data::DdlData, rdb_meta_manager::RDB_PRIMARY_KEY_FLAG},
+};
+use anyhow::bail;
 use futures::TryStreamExt;
 use sqlx::{Pool, Postgres, Row};
 
@@ -34,17 +38,24 @@ impl PgMetaManager {
     }
 
     pub async fn close(&self) -> anyhow::Result<()> {
-        self.conn_pool.close().await;
         Ok(())
     }
 
     pub fn get_col_type_by_oid(&mut self, oid: i32) -> anyhow::Result<PgColType> {
-        Ok(self
+        self
             .type_registry
             .oid_to_type
             .get(&oid)
-            .with_context(|| format!("no type found for oid: [{}]", oid))?
-            .clone())
+            .cloned()
+            .ok_or_else(|| {
+                DtError::DatabaseUnsupportedTableStructure(DbType::Pg, format!(
+                    "PostgreSQL type ID {oid} is not available in the source type catalog"
+                ))
+                    .message("A PostgreSQL column type used by the source is not supported")
+                    .hint(
+                        "Check the reported source column type and exclude or convert unsupported columns before retrying.",
+                    )
+            })
     }
 
     pub fn update_tb_meta_by_oid(&mut self, oid: i32, tb_meta: PgTbMeta) -> anyhow::Result<()> {
@@ -55,11 +66,19 @@ impl PgMetaManager {
     }
 
     pub fn get_tb_meta_by_oid(&mut self, oid: i32) -> anyhow::Result<PgTbMeta> {
-        Ok(self
+        self
             .oid_to_tb_meta
             .get(&oid)
-            .with_context(|| format!("no tb_meta found for oid: [{}]", oid))?
-            .clone())
+            .cloned()
+            .ok_or_else(|| {
+                DtError::DatabaseStatementFailed(DbType::Pg, format!(
+                    "a change event for source relation ID {oid} arrived before Ape-DTS received its table definition"
+                ))
+                    .message("A PostgreSQL change event could not be decoded")
+                    .hint(
+                        "Restart from an earlier LSN so Ape-DTS can reload the relation definition. If it repeats, check the publication and PostgreSQL replication logs.",
+                    )
+            })
     }
 
     pub async fn get_tb_meta_by_row_data<'a>(
@@ -77,11 +96,17 @@ impl PgMetaManager {
         let full_name = format!(r#""{}"."{}""#, schema, tb);
         if !self.name_to_tb_meta.contains_key(&full_name) {
             let oid = Self::get_oid(&self.conn_pool, schema, tb).await?;
-            let (cols, col_origin_type_map, col_type_map) =
+            let (cols, col_origin_type_map, col_type_map, nullable_cols) =
                 Self::parse_cols(&self.conn_pool, &mut self.type_registry, schema, tb).await?;
-            let key_map = Self::parse_keys(&self.conn_pool, schema, tb).await?;
-            let (order_col, partition_col, id_cols) =
-                RdbMetaManager::parse_rdb_cols(&key_map, &cols)?;
+            let mut key_map = Self::parse_keys(&self.conn_pool, schema, tb).await?;
+            // unique indexes (e.g. CREATE UNIQUE INDEX) are not in table_constraints;
+            let unique_index_keys =
+                Self::parse_unique_index_keys(&self.conn_pool, schema, tb).await?;
+            for (k, v) in unique_index_keys {
+                key_map.entry(k).or_insert(v);
+            }
+            let (order_cols, partition_col, id_cols) =
+                RdbMetaManager::parse_rdb_cols(&key_map, &cols, &nullable_cols)?;
             // disable get_foreign_keys since we don't support foreign key check
             let (foreign_keys, ref_by_foreign_keys) = (vec![], vec![]);
             // let (foreign_keys, ref_by_foreign_keys) =
@@ -91,9 +116,10 @@ impl PgMetaManager {
                 schema: schema.to_string(),
                 tb: tb.to_string(),
                 cols,
+                nullable_cols,
                 col_origin_type_map,
                 key_map,
-                order_col,
+                order_cols,
                 partition_col,
                 id_cols,
                 foreign_keys,
@@ -107,7 +133,29 @@ impl PgMetaManager {
             self.oid_to_tb_meta.insert(oid, tb_meta.clone());
             self.name_to_tb_meta.insert(full_name.clone(), tb_meta);
         }
-        Ok(self.name_to_tb_meta.get(&full_name).unwrap())
+        self.name_to_tb_meta.get(&full_name).ok_or_else(|| {
+            DtError::DatabaseObjectNotFound(DbType::Pg, format!(
+                "Ape-DTS could not find the previously loaded definition for source table {full_name}"
+            ))
+                .message("The source table definition could not be loaded")
+                .hint(
+                    "Verify that the source table still exists and is readable, then restart the task.",
+                )
+                .object(ErrorObject {
+                    schema: Some(schema.to_string()),
+                    table: Some(tb.to_string()),
+                    ..Default::default()
+                })
+        })
+    }
+
+    pub fn invalidate_cache_for_table(&mut self, schema: &str, tb: &str) {
+        if !schema.is_empty() && !tb.is_empty() {
+            let full_name = format!(r#""{}"."{}""#, schema, tb);
+            if let Some(tb_meta) = self.name_to_tb_meta.remove(&full_name) {
+                self.oid_to_tb_meta.remove(&tb_meta.oid);
+            }
+        }
     }
 
     pub fn invalidate_cache(&mut self, schema: &str, tb: &str) {
@@ -134,14 +182,16 @@ impl PgMetaManager {
         Vec<String>,
         HashMap<String, String>,
         HashMap<String, PgColType>,
+        HashSet<String>,
     )> {
         let mut cols = Vec::new();
         let mut col_origin_type_map = HashMap::new();
         let mut col_type_map = HashMap::new();
+        let mut nullable_cols = HashSet::new();
 
         // get cols of the table
         let sql = format!(
-            "SELECT column_name FROM information_schema.columns 
+            "SELECT column_name, is_nullable FROM information_schema.columns 
             WHERE table_schema='{}' AND table_name = '{}' 
             ORDER BY ordinal_position;",
             schema, tb
@@ -149,12 +199,17 @@ impl PgMetaManager {
         let mut rows = sqlx::query(&sql).fetch(conn_pool);
         while let Some(row) = rows.try_next().await? {
             let col: String = row.try_get("column_name")?;
-            cols.push(col);
+            cols.push(col.clone());
+
+            let is_nullable = row.try_get::<String, _>("is_nullable")?.to_lowercase() == "yes";
+            if is_nullable {
+                nullable_cols.insert(col);
+            }
         }
 
         // get col_type_oid of the table
         let sql = format!(
-            "SELECT a.attname AS col_name, a.atttypid as col_type_oid
+            "SELECT a.attname AS col_name, a.atttypid as col_type_oid, a.atttypmod as col_type_mod
             FROM pg_class t, pg_attribute a
             WHERE a.attrelid = t.oid
                 AND t.relname = '{}'
@@ -170,16 +225,31 @@ impl PgMetaManager {
             }
 
             let col_type_oid: i32 = row.try_get_unchecked("col_type_oid")?;
-            let col_type = type_registry
+            let col_type_mod: i32 = row.try_get_unchecked("col_type_mod")?;
+            let mut col_type = type_registry
                 .oid_to_type
                 .get(&col_type_oid)
-                .unwrap()
-                .clone();
-            col_origin_type_map.insert(col.clone(), col_type.alias.clone());
+                .cloned()
+                .ok_or_else(|| {
+                    DtError::DatabaseUnsupportedTableStructure(
+                        DbType::Pg,
+                        format!(
+                            "PostgreSQL type OID {col_type_oid} is missing from the type registry"
+                        ),
+                    )
+                    .object(ErrorObject {
+                        schema: Some(schema.to_string()),
+                        table: Some(tb.to_string()),
+                        column: Some(col.clone()),
+                        ..Default::default()
+                    })
+                })?;
+            col_type.typmod = col_type_mod;
+            col_origin_type_map.insert(col.clone(), col_type.get_alias());
             col_type_map.insert(col, col_type);
         }
 
-        Ok((cols, col_origin_type_map, col_type_map))
+        Ok((cols, col_origin_type_map, col_type_map, nullable_cols))
     }
 
     async fn parse_keys(
@@ -215,7 +285,7 @@ impl PgMetaManager {
             let constraint_type: String = row.try_get("constraint_type")?;
             let mut key_name: String = row.try_get("constraint_name")?;
             if constraint_type == "PRIMARY KEY" {
-                key_name = "primary".to_string();
+                key_name = RDB_PRIMARY_KEY_FLAG.to_string();
             }
 
             // key_map
@@ -228,6 +298,43 @@ impl PgMetaManager {
         Ok(key_map)
     }
 
+    async fn parse_unique_index_keys(
+        conn_pool: &Pool<Postgres>,
+        schema: &str,
+        tb: &str,
+    ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+        let sql = format!(
+            r#"
+            SELECT
+                i.relname AS index_name,
+                a.attname AS col_name,
+                k.ord AS ord
+            FROM pg_class t
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_index ix ON ix.indrelid = t.oid
+            JOIN pg_class i ON i.oid = ix.indexrelid
+            LEFT JOIN pg_constraint c
+                   ON c.conindid = ix.indexrelid
+                  AND c.contype IN ('p','u')
+            CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+                AND a.attnum > 0 AND NOT a.attisdropped
+            WHERE n.nspname = '{}' AND t.relname = '{}'
+              AND ix.indisunique
+              AND c.oid IS NULL
+            ORDER BY i.relname, k.ord"#,
+            schema, tb
+        );
+        let mut rows = sqlx::query(&sql).fetch(conn_pool);
+        let mut key_map: HashMap<String, Vec<String>> = HashMap::new();
+        while let Some(row) = rows.try_next().await? {
+            let index_name: String = row.try_get("index_name")?;
+            let col_name: String = row.try_get("col_name")?;
+            key_map.entry(index_name).or_default().push(col_name);
+        }
+        Ok(key_map)
+    }
+
     async fn get_oid(conn_pool: &Pool<Postgres>, schema: &str, tb: &str) -> anyhow::Result<i32> {
         let sql = format!(r#"SELECT '"{}"."{}"'::regclass::oid;"#, schema, tb);
         let mut rows = sqlx::query(&sql).fetch(conn_pool);
@@ -236,10 +343,12 @@ impl PgMetaManager {
             return Ok(oid);
         }
 
-        bail! {Error::MetadataError(format!(
-            "failed to get oid for: {} by query: {}",
-            tb, sql
-        ))}
+        bail! {DtError::DatabaseObjectNotFound(DbType::Pg, format!("failed to get oid for: {} by query: {}", tb, sql))
+        .object(ErrorObject {
+            schema: Some(schema.to_string()),
+            table: Some(tb.to_string()),
+            ..Default::default()
+        })}
     }
 
     #[allow(dead_code)]

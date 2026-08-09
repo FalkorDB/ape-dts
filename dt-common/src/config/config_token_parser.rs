@@ -1,6 +1,6 @@
 use anyhow::bail;
 
-use crate::{error::Error, utils::sql_util::SqlUtil};
+use crate::{error::DtError, utils::sql_util::SqlUtil};
 
 use super::config_enums::DbType;
 
@@ -24,7 +24,7 @@ impl From<(String, String)> for TokenEscapePair {
 
 impl TokenEscapePair {
     pub fn from_char_pairs(char_pairs: Vec<(char, char)>) -> Vec<Self> {
-        char_pairs.into_iter().map(|e| Self::from(e)).collect()
+        char_pairs.into_iter().map(Self::from).collect()
     }
 
     pub fn match_escape_left(&self, chars: &[char], start_index: usize) -> bool {
@@ -84,7 +84,7 @@ impl ConfigTokenParser {
         let tokens = Self::parse(config_str, delimiters, &token_escape_pairs);
         for token in tokens.iter() {
             if !SqlUtil::is_valid_token(token, db_type, &escape_pairs) {
-                bail! {Error::ConfigError(format!(
+                bail! {DtError::InvalidConfig(format!(
                     "config error near: {}, try enclose database/table/column with escapes if there are special characters other than letters and numbers",
                     token
                 ))}
@@ -188,7 +188,7 @@ impl ConfigTokenParser {
                     token.push(*c);
                     read_count += 1;
                     if read_count > prefix_len
-                        && escape_pair.match_escape_right(&chars, start_index + read_count - 1)
+                        && escape_pair.match_escape_right(chars, start_index + read_count - 1)
                     {
                         break;
                     }

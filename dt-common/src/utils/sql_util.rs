@@ -1,12 +1,35 @@
 use regex::Regex;
+use sqlx::{mysql::MySqlRow, ColumnIndex, Row};
 
 use crate::config::config_enums::DbType;
+use crate::meta::mysql::mysql_col_type::MysqlColType;
 
 pub struct SqlUtil {}
 
-const MYSQL_ESCAPE: char = '`';
-const PG_ESCAPE: char = '"';
-const REDIS_ESCAPE: char = '"';
+pub const MYSQL_ESCAPE: char = '`';
+pub const PG_ESCAPE: char = '"';
+pub const REDIS_ESCAPE: char = '"';
+
+#[macro_export]
+macro_rules! quote_mysql {
+    () => {
+        ""
+    };
+    ($s:expr) => {
+        // return borrowed str
+        format_args!("{}{}{}", MYSQL_ESCAPE, $s, MYSQL_ESCAPE)
+    };
+}
+
+#[macro_export]
+macro_rules! quote_pg {
+    () => {
+        ""
+    };
+    ($s:expr) => {
+        format_args!("{}{}{}", PG_ESCAPE, $s, PG_ESCAPE)
+    };
+}
 
 impl SqlUtil {
     pub fn is_escaped(token: &str, escape_pair: &(char, char)) -> bool {
@@ -54,9 +77,29 @@ impl SqlUtil {
         escaped_cols
     }
 
+    pub fn mysql_spatial_as_wkb_expr(col: &str, alias: &str) -> String {
+        format!("ST_AsBinary({}) AS {}", col, alias)
+    }
+
+    pub fn mysql_spatial_from_wkb_hex_expr(hex_value: &str) -> String {
+        format!("ST_GeomFromWKB(x'{}')", hex_value)
+    }
+
+    pub fn mysql_spatial_from_wkb_placeholder_expr() -> String {
+        "ST_GeomFromWKB(?)".to_string()
+    }
+
+    pub fn mysql_comparison_placeholder(col_type: &MysqlColType) -> String {
+        // https://dev.mysql.com/doc/refman/5.7/en/type-conversion.html
+        match col_type {
+            MysqlColType::Time { precision } => format!("CAST(? AS TIME({}))", precision),
+            _ => "?".to_string(),
+        }
+    }
+
     pub fn get_escape_pairs(db_type: &DbType) -> Vec<(char, char)> {
         match db_type {
-            DbType::Mysql | DbType::ClickHouse | DbType::Foxlake | DbType::StarRocks => {
+            DbType::Mysql | DbType::ClickHouse | DbType::StarRocks => {
                 vec![(MYSQL_ESCAPE, MYSQL_ESCAPE)]
             }
             DbType::Pg => vec![(PG_ESCAPE, PG_ESCAPE)],
@@ -75,6 +118,31 @@ impl SqlUtil {
         }
     }
 
+    pub fn try_get_mysql_string<I>(row: &MySqlRow, index: I) -> anyhow::Result<String>
+    where
+        I: ColumnIndex<MySqlRow> + Copy,
+    {
+        match row.try_get::<String, _>(index) {
+            Ok(value) => Ok(value),
+            Err(_) => Ok(String::from_utf8_lossy(&row.try_get::<Vec<u8>, _>(index)?).into_owned()),
+        }
+    }
+
+    pub fn try_get_mysql_optional_string<I>(
+        row: &MySqlRow,
+        index: I,
+    ) -> anyhow::Result<Option<String>>
+    where
+        I: ColumnIndex<MySqlRow> + Copy,
+    {
+        match row.try_get::<Option<String>, _>(index) {
+            Ok(value) => Ok(value),
+            Err(_) => Ok(row
+                .try_get::<Option<Vec<u8>>, _>(index)?
+                .map(|value| String::from_utf8_lossy(&value).into_owned())),
+        }
+    }
+
     pub fn is_valid_token(token: &str, db_type: &DbType, escape_pairs: &[(char, char)]) -> bool {
         let max_token_len = match db_type {
             DbType::Mysql | DbType::Pg => 64,
@@ -86,7 +154,7 @@ impl SqlUtil {
             match db_type {
                 DbType::Mysql | DbType::Pg => {
                     let pattern = format!(r"^[a-zA-Z0-9_\?\*\-]{{1,{}}}$", max_token_len);
-                    Regex::new(&pattern).unwrap().is_match(token)
+                    Regex::new(&pattern).is_ok_and(|regex| regex.is_match(token))
                 }
                 // TODO
                 _ => true,
@@ -112,8 +180,8 @@ impl SqlUtil {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
+
     #[test]
     #[ignore]
     fn test_check_valid_token_without_escapes() {
@@ -200,5 +268,21 @@ mod tests {
             &db_type,
             &escape_pairs
         ));
+    }
+
+    #[test]
+    fn test_mysql_spatial_exprs() {
+        assert_eq!(
+            "ST_AsBinary(`geo`) AS `geo`",
+            SqlUtil::mysql_spatial_as_wkb_expr("`geo`", "`geo`")
+        );
+        assert_eq!(
+            "ST_GeomFromWKB(x'0101000000000000000000F03F000000000000F03F')",
+            SqlUtil::mysql_spatial_from_wkb_hex_expr("0101000000000000000000F03F000000000000F03F")
+        );
+        assert_eq!(
+            "ST_GeomFromWKB(?)",
+            SqlUtil::mysql_spatial_from_wkb_placeholder_expr()
+        );
     }
 }

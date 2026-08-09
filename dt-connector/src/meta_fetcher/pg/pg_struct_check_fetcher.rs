@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
-use dt_common::meta::{
-    adaptor::pg_col_value_convertor::PgColValueConvertor,
-    col_value::ColValue,
-    pg::{pg_col_type::PgColType, pg_value_type::PgValueType},
+use dt_common::{
+    error::{DtResultExt, ErrorCode},
+    meta::{
+        adaptor::pg_col_value_convertor::PgColValueConvertor,
+        col_value::ColValue,
+        pg::{pg_col_type::PgColType, pg_value_type::PgValueType},
+    },
 };
 use futures::TryStreamExt;
 use sqlx::{postgres::PgRow, Pool, Postgres, Row};
@@ -63,18 +66,18 @@ impl PgStructCheckFetcher {
         col_types.insert("oid", Self::mock_col_type("oid"));
 
         let rows = self.execute_sql(&sql, &col_names, &col_types).await?;
-        if !rows.is_empty() {
-            return Ok(rows[0].get("oid").unwrap().into());
+        if let Some(oid) = rows.first().and_then(|row| row.get("oid")) {
+            return Ok(oid.into());
         }
         Ok(String::new())
     }
 
     async fn get_table_summary(&self, oid: &str) -> anyhow::Result<Vec<HashMap<String, String>>> {
         let sql = format!(
-            r#"SELECT c.relchecks, c.relkind, c.relhasindex, c.relhasrules, 
+            r#"SELECT c.relchecks, c.relkind::text AS relkind, c.relhasindex, c.relhasrules, 
             c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false AS relhasoids, c.relispartition, '', 
             c.reltablespace::int8, 
-            CASE WHEN c.reloftype = 0 THEN '' ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, c.relpersistence, c.relreplident, am.amname
+            CASE WHEN c.reloftype = 0 THEN '' ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, c.relpersistence::text AS relpersistence, c.relreplident::text AS relreplident, am.amname
             FROM pg_catalog.pg_class c
             LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)
             LEFT JOIN pg_catalog.pg_am am ON (c.relam = am.oid)
@@ -147,7 +150,7 @@ impl PgStructCheckFetcher {
     async fn get_table_indexes(&self, oid: &str) -> anyhow::Result<Vec<HashMap<String, String>>> {
         let sql = format!(
             r#"SELECT c2.relname, i.indisprimary, i.indisunique, i.indisclustered, i.indisvalid, pg_catalog.pg_get_indexdef(i.indexrelid, 0, true),
-                pg_catalog.pg_get_constraintdef(con.oid, true), contype, condeferrable, condeferred, i.indisreplident, 
+                pg_catalog.pg_get_constraintdef(con.oid, true), contype::text AS contype, condeferrable, condeferred, i.indisreplident, 
                 c2.reltablespace::int8
             FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i
                 LEFT JOIN pg_catalog.pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x'))
@@ -227,7 +230,7 @@ impl PgStructCheckFetcher {
     ) -> anyhow::Result<Vec<HashMap<String, String>>> {
         let mut results = Vec::new();
         let mut rows = sqlx::query(sql).fetch(&self.conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        while let Some(row) = rows.try_next().await.code(ErrorCode::MetadataReadFailed)? {
             let res = Self::parse_row(&row, col_names, col_types)?;
             results.push(res);
         }
@@ -244,7 +247,7 @@ impl PgStructCheckFetcher {
             let col_value = if let Some(col_type) = col_types.get(*col_name) {
                 PgColValueConvertor::from_query(row, col_name, col_type)?
             } else {
-                let value: Option<String> = row.try_get_unchecked(col_name).unwrap();
+                let value: Option<String> = row.try_get_unchecked(col_name)?;
                 if let Some(v) = value {
                     ColValue::String(v)
                 } else {
@@ -271,6 +274,8 @@ impl PgStructCheckFetcher {
             element_oid: 0,
             category: String::new(),
             enum_values: None,
+            schema_name: String::new(),
+            typmod: 0,
         };
 
         if !alias.is_empty() {

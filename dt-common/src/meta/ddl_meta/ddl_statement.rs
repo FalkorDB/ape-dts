@@ -34,6 +34,8 @@ pub enum DdlStatement {
     RenameTable(RenameTableStatement),
     PgDropIndex(PgDropIndexStatement),
 
+    MongoCommand(MongoCommandStatement),
+
     #[default]
     Unknown,
 }
@@ -116,8 +118,11 @@ impl DdlStatement {
             DdlStatement::PgDropIndex(_)
             | DdlStatement::PgDropMultiIndex(_)
             | DdlStatement::DropMultiTable(_)
-            | DdlStatement::RenameMultiTable(_)
-            | DdlStatement::Unknown => (String::new(), String::new()),
+            | DdlStatement::RenameMultiTable(_) => (String::new(), String::new()),
+
+            DdlStatement::MongoCommand(s) => (s.schema.clone(), s.tb.clone()),
+
+            DdlStatement::Unknown => (String::new(), String::new()),
         }
     }
 
@@ -126,6 +131,7 @@ impl DdlStatement {
             DdlStatement::RenameTable(s) => (s.new_schema.clone(), s.new_tb.clone()),
             DdlStatement::MysqlAlterTableRename(s) => (s.new_db.clone(), s.new_tb.clone()),
             DdlStatement::PgAlterTableRename(s) => (s.new_schema.clone(), s.new_tb.clone()),
+            DdlStatement::MongoCommand(s) => (s.new_schema.clone(), s.new_tb.clone()),
             _ => (String::new(), String::new()),
         }
     }
@@ -168,6 +174,13 @@ impl DdlStatement {
                     s.new_schema = dst_new_schema;
                 }
                 s.tb = dst_tb;
+                s.new_tb = dst_new_tb;
+            }
+
+            DdlStatement::MongoCommand(s) => {
+                s.schema = dst_schema;
+                s.tb = dst_tb;
+                s.new_schema = dst_new_schema;
                 s.new_tb = dst_new_tb;
             }
 
@@ -253,6 +266,11 @@ impl DdlStatement {
                 s.tb = dst_tb;
             }
 
+            DdlStatement::MongoCommand(s) => {
+                s.schema = dst_schema;
+                s.tb = dst_tb;
+            }
+
             DdlStatement::DropTable(s) => {
                 if !s.schema.is_empty() {
                     s.schema = dst_schema;
@@ -272,6 +290,14 @@ impl DdlStatement {
             | DdlStatement::Unknown => {}
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MongoCommandStatement {
+    pub schema: String,
+    pub tb: String,
+    pub new_schema: String,
+    pub new_tb: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -298,6 +324,7 @@ pub struct AlterDatabaseStatement {
 pub struct CreateSchemaStatement {
     pub schema: String,
     pub if_not_exists: bool,
+    pub authorization: bool,
     pub unparsed: String,
 }
 
@@ -311,6 +338,7 @@ pub struct DropSchemaStatement {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AlterSchemaStatement {
     pub schema: String,
+    pub new_schema: Option<String>,
     pub unparsed: String,
 }
 
@@ -503,6 +531,9 @@ impl DdlStatement {
                 if s.if_not_exists {
                     sql = format!("{} IF NOT EXISTS", sql);
                 }
+                if s.authorization {
+                    sql = format!("{} AUTHORIZATION", sql);
+                }
                 sql = append_identifier(&sql, &s.schema, true, db_type);
                 append_unparsed(sql, &s.unparsed)
             }
@@ -519,7 +550,12 @@ impl DdlStatement {
             DdlStatement::AlterSchema(s) => {
                 let mut sql = "ALTER SCHEMA".to_string();
                 sql = append_identifier(&sql, &s.schema, true, db_type);
-                append_unparsed(sql, &s.unparsed)
+                if let Some(new_schema) = &s.new_schema {
+                    sql = format!("{} RENAME TO", sql);
+                    append_identifier(&sql, new_schema, true, db_type)
+                } else {
+                    append_unparsed(sql, &s.unparsed)
+                }
             }
 
             DdlStatement::MysqlCreateTable(s) => {
@@ -726,6 +762,11 @@ impl DdlStatement {
             DdlStatement::AlterSchema(alter_schema_statement) => {
                 size += alter_schema_statement.schema.len() as u64;
                 size += alter_schema_statement.unparsed.len() as u64;
+                size += std::mem::size_of::<Option<String>>() as u64;
+                size += alter_schema_statement
+                    .new_schema
+                    .as_ref()
+                    .map_or(0, |s| s.len() as u64);
             }
             DdlStatement::MysqlCreateTable(mysql_create_table_statement) => {
                 size += mysql_create_table_statement.db.len() as u64;
@@ -877,6 +918,12 @@ impl DdlStatement {
                 size += mysql_drop_index_statement.tb.len() as u64;
                 size += mysql_drop_index_statement.index_name.len() as u64;
                 size += mysql_drop_index_statement.unparsed.len() as u64;
+            }
+            DdlStatement::MongoCommand(mongo_command_statement) => {
+                size += mongo_command_statement.schema.len() as u64;
+                size += mongo_command_statement.tb.len() as u64;
+                size += mongo_command_statement.new_schema.len() as u64;
+                size += mongo_command_statement.new_tb.len() as u64;
             }
             DdlStatement::Unknown => {}
         }

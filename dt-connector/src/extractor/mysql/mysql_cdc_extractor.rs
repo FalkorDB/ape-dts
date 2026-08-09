@@ -5,26 +5,36 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
-use anyhow::bail;
+use anyhow::{bail, Context as AnyhowContext};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use sqlx::{mysql::MySqlArguments, query::Query, MySql, Pool};
 use tokio::{sync::Mutex, time::Instant};
 
+use mysql_binlog_connector_rust::{
+    binlog_client::{BinlogClient, StartPosition},
+    command::gtid_set::GtidSet,
+    event::{
+        event_data::EventData, event_header::EventHeader, query_event::QueryEvent,
+        row_event::RowEvent, table_map_event::TableMapEvent,
+    },
+};
+
 use crate::{
-    close_conn_pool,
     extractor::{
-        base_extractor::BaseExtractor, mysql::binlog_util::BinlogUtil,
-        resumer::cdc_resumer::CdcResumer,
+        base_extractor::{BaseExtractor, ExtractState},
+        mysql::binlog_util::BinlogUtil,
+        resumer::recovery::Recovery,
     },
     Extractor,
 };
 use dt_common::{
-    config::config_enums::DbType,
-    error::Error,
-    log_debug, log_error, log_info,
+    config::{config_enums::DbType, connection_auth_config::ConnectionAuthConfig},
+    error::DtError,
+    log_debug, log_error, log_info, log_warn,
     meta::{
         adaptor::mysql_col_value_convertor::MysqlColValueConvertor, col_value::ColValue,
         dt_data::DtData, mysql::mysql_meta_manager::MysqlMetaManager, position::Position,
@@ -33,21 +43,15 @@ use dt_common::{
     rdb_filter::RdbFilter,
     utils::time_util::TimeUtil,
 };
-use mysql_binlog_connector_rust::{
-    binlog_client::BinlogClient,
-    command::gtid_set::GtidSet,
-    event::{
-        event_data::EventData, event_header::EventHeader, query_event::QueryEvent,
-        row_event::RowEvent, table_map_event::TableMapEvent,
-    },
-};
 
 pub struct MysqlCdcExtractor {
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
     pub meta_manager: MysqlMetaManager,
     pub conn_pool: Pool<MySql>,
     pub filter: RdbFilter,
     pub url: String,
+    pub connection_auth: ConnectionAuthConfig,
     pub binlog_filename: String,
     pub binlog_position: u32,
     pub server_id: u64,
@@ -57,8 +61,10 @@ pub struct MysqlCdcExtractor {
     pub binlog_timeout_secs: u64,
     pub heartbeat_interval_secs: u64,
     pub heartbeat_tb: String,
+    pub keepalive_idle_secs: u64,
+    pub keepalive_interval_secs: u64,
     pub syncer: Arc<Mutex<Syncer>>,
-    pub resumer: CdcResumer,
+    pub recovery: Option<Arc<dyn Recovery + Send + Sync>>,
 }
 
 struct Context {
@@ -72,9 +78,9 @@ const QUERY_BEGIN: &str = "BEGIN";
 #[async_trait]
 impl Extractor for MysqlCdcExtractor {
     async fn extract(&mut self) -> anyhow::Result<()> {
-        if self.base_extractor.time_filter.start_timestamp > 0 {
+        if self.extract_state.time_filter.start_timestamp > 0 {
             self.binlog_filename = BinlogUtil::find_last_binlog_before_timestamp(
-                self.base_extractor.time_filter.start_timestamp,
+                self.extract_state.time_filter.start_timestamp,
                 &self.url,
                 self.server_id,
                 &self.conn_pool,
@@ -82,23 +88,33 @@ impl Extractor for MysqlCdcExtractor {
             .await?;
         }
 
-        if let Position::MysqlCdc {
-            binlog_filename,
-            next_event_position,
-            gtid_set,
-            ..
-        } = &self.resumer.checkpoint_position
-        {
-            self.binlog_filename = binlog_filename.to_owned();
-            self.binlog_position = next_event_position.to_owned();
-            self.gtid_set = gtid_set.to_owned();
-            log_info!("resume from: {}", self.resumer.checkpoint_position);
-            self.base_extractor
-                .push_dt_data(
-                    DtData::Heartbeat {},
-                    self.resumer.checkpoint_position.clone(),
-                )
-                .await?;
+        if let Some(recovery) = &self.recovery {
+            if let Some(position) = recovery.get_cdc_resume_position().await {
+                match &position {
+                    Position::MysqlCdc {
+                        binlog_filename,
+                        next_event_position,
+                        gtid_set,
+                        ..
+                    } => {
+                        self.binlog_filename = binlog_filename.to_owned();
+                        self.binlog_position = next_event_position.to_owned();
+                        self.gtid_set = gtid_set.to_owned();
+                        log_info!(
+                            "cdc recovery from binlogfile:[{}], binlog_position:[{}], gtid_set:[{}]",
+                            binlog_filename,
+                            next_event_position,
+                            gtid_set
+                        );
+                        self.base_extractor
+                            .push_dt_data(&mut self.extract_state, DtData::Heartbeat {}, position)
+                            .await?;
+                    }
+                    _ => {
+                        log_warn!("position:{} is not a valid mysql cdc position", position);
+                    }
+                }
+            }
         }
 
         log_info!(
@@ -111,28 +127,41 @@ impl Extractor for MysqlCdcExtractor {
             self.heartbeat_tb
         );
         self.extract_internal().await?;
-        self.base_extractor.wait_task_finish().await
+        self.base_extractor
+            .wait_task_finish(&mut self.extract_state)
+            .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
-        self.meta_manager.close().await?;
-        return close_conn_pool!(self);
+        self.meta_manager.close().await
     }
 }
 
 impl MysqlCdcExtractor {
     async fn extract_internal(&mut self) -> anyhow::Result<()> {
-        let mut client = BinlogClient {
-            url: self.url.clone(),
-            binlog_filename: self.binlog_filename.clone(),
-            binlog_position: self.binlog_position,
-            server_id: self.server_id,
-            gtid_enabled: self.gtid_enabled,
-            gtid_set: self.gtid_set.clone(),
-            heartbeat_interval_secs: self.binlog_heartbeat_interval_secs,
-            timeout_secs: self.binlog_timeout_secs,
+        let start_position = if self.gtid_enabled && !self.gtid_set.is_empty() {
+            StartPosition::Gtid(self.gtid_set.clone())
+        } else if !self.binlog_filename.is_empty() {
+            StartPosition::BinlogPosition(self.binlog_filename.clone(), self.binlog_position)
+        } else {
+            StartPosition::Latest {}
         };
-        let mut stream = client.connect().await?;
+
+        let url = ConnectionAuthConfig::merge_url_with_auth(&self.url, &self.connection_auth)
+            .context(DtError::DatabaseInvalidConfig(
+                DbType::Mysql,
+                "failed to merge the MySQL URL with connection authentication".to_string(),
+            ))?;
+
+        let mut stream = BinlogClient::new(&url, self.server_id, start_position)
+            .with_master_heartbeat(Duration::from_secs(self.binlog_heartbeat_interval_secs))
+            .with_read_timeout(Duration::from_secs(self.binlog_timeout_secs))
+            .with_keepalive(
+                Duration::from_secs(self.keepalive_idle_secs),
+                Duration::from_secs(self.keepalive_interval_secs),
+            )
+            .connect()
+            .await?;
 
         let mut ctx = Context {
             binlog_filename: self.binlog_filename.clone(),
@@ -140,24 +169,26 @@ impl MysqlCdcExtractor {
             gtid_set: None,
         };
         if self.gtid_enabled {
-            ctx.gtid_set = Some(GtidSet::new(&client.gtid_set)?);
+            ctx.gtid_set = Some(GtidSet::new(self.gtid_set.as_str())?);
         }
 
         // start heartbeat
         self.start_heartbeat(self.base_extractor.shut_down.clone())?;
 
         loop {
-            if self.base_extractor.time_filter.ended {
+            if self.extract_state.time_filter.ended {
                 stream.close().await?;
                 return Ok(());
             }
 
-            let (header, data) = stream.read().await?;
+            let (header, data) = stream
+                .read()
+                .await
+                .context("failed to read the MySQL binlog stream")?;
             match data {
                 EventData::Rotate(r) => {
                     ctx.binlog_filename = r.binlog_filename;
                 }
-
                 _ => self.parse_events(header, data, &mut ctx).await?,
             }
         }
@@ -176,15 +207,13 @@ impl MysqlCdcExtractor {
             data
         );
 
-        // TODO, get server_id from source mysql
-        let server_id = String::new();
         let timestamp = Position::format_timestamp_millis(header.timestamp as i64 * 1000);
         let mut gtid_set_str = String::new();
         if let Some(gtid_set) = &ctx.gtid_set {
             gtid_set_str = gtid_set.to_string();
         }
         let position = Position::MysqlCdc {
-            server_id,
+            server_id: self.server_id.to_string(),
             binlog_filename: ctx.binlog_filename.clone(),
             next_event_position: header.next_event_position,
             gtid_set: gtid_set_str,
@@ -213,8 +242,13 @@ impl MysqlCdcExtractor {
 
             EventData::WriteRows(mut w) => {
                 for event in w.rows.iter_mut() {
-                    let table_map_event = ctx.table_map_event_map.get(&w.table_id).unwrap();
+                    let table_map_event =
+                        ctx.table_map_event_map.get(&w.table_id).ok_or_else(|| {
+                            DtError::mysql_binlog_table_map_missing(w.table_id, "write rows")
+                        })?;
                     if self.filter_event(table_map_event, RowType::Insert) {
+                        self.extract_state
+                            .record_extracted_metrics(1, size_of_val(event) as u64);
                         continue;
                     }
 
@@ -224,6 +258,7 @@ impl MysqlCdcExtractor {
                     let row_data = RowData::new(
                         table_map_event.database_name.clone(),
                         table_map_event.table_name.clone(),
+                        0,
                         RowType::Insert,
                         None,
                         Some(col_values),
@@ -234,8 +269,13 @@ impl MysqlCdcExtractor {
 
             EventData::UpdateRows(mut u) => {
                 for event in u.rows.iter_mut() {
-                    let table_map_event = ctx.table_map_event_map.get(&u.table_id).unwrap();
+                    let table_map_event =
+                        ctx.table_map_event_map.get(&u.table_id).ok_or_else(|| {
+                            DtError::mysql_binlog_table_map_missing(u.table_id, "update rows")
+                        })?;
                     if self.filter_event(table_map_event, RowType::Update) {
+                        self.extract_state
+                            .record_extracted_metrics(1, size_of_val(event) as u64);
                         continue;
                     }
 
@@ -248,6 +288,7 @@ impl MysqlCdcExtractor {
                     let row_data = RowData::new(
                         table_map_event.database_name.clone(),
                         table_map_event.table_name.clone(),
+                        0,
                         RowType::Update,
                         Some(col_values_before),
                         Some(col_values_after),
@@ -258,8 +299,13 @@ impl MysqlCdcExtractor {
 
             EventData::DeleteRows(mut d) => {
                 for event in d.rows.iter_mut() {
-                    let table_map_event = ctx.table_map_event_map.get(&d.table_id).unwrap();
+                    let table_map_event =
+                        ctx.table_map_event_map.get(&d.table_id).ok_or_else(|| {
+                            DtError::mysql_binlog_table_map_missing(d.table_id, "delete rows")
+                        })?;
                     if self.filter_event(table_map_event, RowType::Delete) {
+                        self.extract_state
+                            .record_extracted_metrics(1, size_of_val(event) as u64);
                         continue;
                     }
 
@@ -269,6 +315,7 @@ impl MysqlCdcExtractor {
                     let row_data = RowData::new(
                         table_map_event.database_name.clone(),
                         table_map_event.table_name.clone(),
+                        0,
                         RowType::Delete,
                         Some(col_values),
                         None,
@@ -280,7 +327,7 @@ impl MysqlCdcExtractor {
             EventData::Query(query) => {
                 if query.query == QUERY_BEGIN {
                     BaseExtractor::update_time_filter(
-                        &mut self.base_extractor.time_filter,
+                        &mut self.extract_state.time_filter,
                         header.timestamp,
                         &position,
                     );
@@ -294,7 +341,7 @@ impl MysqlCdcExtractor {
                     xid: xid.xid.to_string(),
                 };
                 self.base_extractor
-                    .push_dt_data(commit, position.clone())
+                    .push_dt_data(&mut self.extract_state, commit, position.clone())
                     .await?;
             }
 
@@ -309,7 +356,9 @@ impl MysqlCdcExtractor {
         row_data: RowData,
         position: Position,
     ) -> anyhow::Result<()> {
-        self.base_extractor.push_row(row_data, position).await
+        self.base_extractor
+            .push_row(&mut self.extract_state, row_data, position)
+            .await
     }
 
     async fn parse_row_data(
@@ -318,7 +367,7 @@ impl MysqlCdcExtractor {
         included_columns: &[bool],
         event: &mut RowEvent,
     ) -> anyhow::Result<HashMap<String, ColValue>> {
-        if !self.base_extractor.time_filter.started {
+        if !self.extract_state.time_filter.started {
             return Ok(HashMap::new());
         }
 
@@ -328,15 +377,20 @@ impl MysqlCdcExtractor {
         let ignore_cols = self.filter.get_ignore_cols(db, tb);
 
         if included_columns.len() != event.column_values.len() {
-            bail! {Error::ExtractorError(
-                "included_columns not match column_values in binlog".into(),
-            )}
+            let detail =
+                "the included-column bitmap does not match the values in the MySQL binlog event";
+            bail!(DtError::MySqlBinlogDecode(detail.to_string()))
         }
 
         let mut data = HashMap::new();
         let col_count = cmp::min(tb_meta.basic.cols.len(), included_columns.len());
         for i in (0..col_count).rev() {
-            let col = tb_meta.basic.cols.get(i).unwrap();
+            let col = tb_meta.basic.cols.get(i).ok_or_else(|| {
+                DtError::DatabaseInvariant(
+                    DbType::Mysql,
+                    format!("column index {i} is missing from MySQL table metadata"),
+                )
+            })?;
             if ignore_cols.is_some_and(|cols| cols.contains(col)) {
                 continue;
             }
@@ -377,7 +431,7 @@ impl MysqlCdcExtractor {
             {
                 if !self.filter.filter_dcl(&dcl_data.dcl_type) {
                     self.base_extractor
-                        .push_dcl(dcl_data.clone(), position.clone())
+                        .push_dcl(&mut self.extract_state, dcl_data.clone(), position.clone())
                         .await?;
                 }
                 return Ok(());
@@ -396,7 +450,11 @@ impl MysqlCdcExtractor {
                     self.meta_manager.invalidate_cache(&db, &tb);
                     if !self.filter.filter_ddl(&db, &tb, &sub_ddl_data.ddl_type) {
                         self.base_extractor
-                            .push_ddl(sub_ddl_data.clone(), position.clone())
+                            .push_ddl(
+                                &mut self.extract_state,
+                                sub_ddl_data.clone(),
+                                position.clone(),
+                            )
                             .await?;
                     }
                 }
@@ -417,7 +475,7 @@ impl MysqlCdcExtractor {
         let tb = &table_map_event.table_name;
         let filtered = self.filter.filter_event(db, tb, &row_type);
         if filtered {
-            return !self.base_extractor.is_data_marker_info(db, tb);
+            return !self.extract_state.is_data_marker_info(db, tb);
         }
         filtered
     }
@@ -426,7 +484,7 @@ impl MysqlCdcExtractor {
         let db_tb = self.base_extractor.precheck_heartbeat(
             self.heartbeat_interval_secs,
             &self.heartbeat_tb,
-            DbType::Pg,
+            DbType::Mysql,
         );
         if db_tb.len() != 2 {
             return Ok(());
@@ -445,9 +503,12 @@ impl MysqlCdcExtractor {
             let mut start_time = Instant::now();
             while !shut_down.load(Ordering::Acquire) {
                 if start_time.elapsed().as_secs() >= heartbeat_interval_secs {
-                    Self::heartbeat(server_id, &db_tb[0], &db_tb[1], &syncer, &conn_pool)
-                        .await
-                        .unwrap();
+                    if let Err(error) =
+                        Self::heartbeat(server_id, &db_tb[0], &db_tb[1], &syncer, &conn_pool).await
+                    {
+                        log_error!("heartbeat failed: {error:#}");
+                        break;
+                    }
                     start_time = Instant::now();
                 }
                 TimeUtil::sleep_millis(1000 * heartbeat_interval_secs).await;

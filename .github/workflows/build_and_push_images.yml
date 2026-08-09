@@ -3,52 +3,101 @@ name: Build and push images
 on:
   workflow_dispatch:
     inputs:
-      docker_repository:
-        description: "Docker registry repository"
+      image_name:
+        description: "Docker image name"
         required: true
         type: string
-        default: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com
+        default: apecloud/ape-dts
       image_tag:
         description: "Docker image tag"
         required: true
         type: string
-        default: apecloud/ape-dts:latest
+        default: latest
       platforms:
         description: "Target platforms for multi-arch build"
         required: true
         type: string
         default: linux/arm64,linux/amd64
+      build_profile:
+        description: "Cargo build profile"
+        required: true
+        type: choice
+        default: release
+        options:
+          - release
+          - profiling
+      enable_tracing:
+        description: "Build with tracing support"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+
+env:
+  DOCKER_REGISTRY_URL: docker.io
+  DOCKER_USER: ${{ secrets.DOCKER_REGISTRY_USER }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_REGISTRY_PASSWORD }}
+  ALIYUN_REGISTRY_URL: apecloud-registry.cn-zhangjiakou.cr.aliyuncs.com
+  ALIYUN_USER: ${{ secrets.ALIYUN_REGISTRY_USER }}
+  ALIYUN_PASSWORD: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
 
 jobs:
   build:
     name: Cross build
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_PROFILE: ${{ inputs.build_profile == 'profiling' && '--profile profiling' || '--release' }}
+      CARGO_TARGET_PROFILE: ${{ inputs.build_profile == 'profiling' && 'profiling' || 'release' }}
+      PROFILING_RUSTFLAGS: ${{ inputs.build_profile == 'profiling' && '-C force-frame-pointers=yes' || '' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up rust
-        uses: dtolnay/rust-toolchain@1.85.0
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install cross
-        run: cargo install cross --version 0.2.5
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build for x86_64
         if: contains(inputs.platforms, 'linux/amd64')
         run: |
-          cross build --target x86_64-unknown-linux-gnu --release --features metrics
-          cp target/x86_64-unknown-linux-gnu/release/dt-main amd64-unknown-linux-gnu-dt-main
+          RUSTFLAGS="${{ inputs.enable_tracing == 'true' && '--cfg tokio_unstable' || '' }} ${PROFILING_RUSTFLAGS}" cross build --target x86_64-unknown-linux-gnu ${CARGO_BUILD_PROFILE} --features metrics${{ inputs.enable_tracing == 'true' && ',tracing' || '' }}
+          cp target/x86_64-unknown-linux-gnu/${CARGO_TARGET_PROFILE}/dt-main amd64-unknown-linux-gnu-dt-main
 
       - name: Build for aarch64
         if: contains(inputs.platforms, 'linux/arm64')
         run: |
-          cross build --target aarch64-unknown-linux-gnu --release --features metrics
-          cp target/aarch64-unknown-linux-gnu/release/dt-main arm64-unknown-linux-gnu-dt-main
+          RUSTFLAGS="${{ inputs.enable_tracing == 'true' && '--cfg tokio_unstable' || '' }} ${PROFILING_RUSTFLAGS}" cross build --target aarch64-unknown-linux-gnu ${CARGO_BUILD_PROFILE} --features metrics${{ inputs.enable_tracing == 'true' && ',tracing' || '' }}
+          cp target/aarch64-unknown-linux-gnu/${CARGO_TARGET_PROFILE}/dt-main arm64-unknown-linux-gnu-dt-main
 
       - name: Set up docker buildx
         uses: docker/setup-buildx-action@v2
 
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.DOCKER_REGISTRY_URL }}
+          username: ${{ env.DOCKER_USER }}
+          password: ${{ env.DOCKER_PASSWORD }}
+
+      - name: Login to Aliyun Hub
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY_URL }}
+          username: ${{ env.ALIYUN_USER }}
+          password: ${{ env.ALIYUN_PASSWORD }}
+
       - name: Build and push docker image
         run: |
-          docker login --username ${{ secrets.DOCKER_USER }} --password ${{ secrets.DOCKER_PASSWORD }} ${{ inputs.docker_repository }}
-          docker buildx build -f Dockerfile.github.workflow --platform ${{ inputs.platforms }} --tag ${{ inputs.docker_repository }}/${{ inputs.image_tag }} --push .
+          docker buildx build -f Dockerfile.github.workflow \
+            --platform ${{ inputs.platforms }} \
+            --build-arg APE_DTS_IMAGE_TAG="${{ inputs.image_tag }}" \
+            --build-arg APE_DTS_COMMIT_ID="${{ github.sha }}" \
+            --tag ${{ env.DOCKER_REGISTRY_URL }}/${{ inputs.image_name }}:${{ inputs.image_tag }} \
+            --tag ${{ env.ALIYUN_REGISTRY_URL }}/${{ inputs.image_name }}:${{ inputs.image_tag }} \
+            --push .

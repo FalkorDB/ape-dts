@@ -1,16 +1,15 @@
-use std::{cmp, collections::HashMap, str::FromStr, sync::Arc};
+use std::{cmp, collections::HashMap, str::FromStr};
 
-use crate::{call_batch_fn, sinker::base_sinker::BaseSinker, Sinker};
-use anyhow::bail;
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::{header, Client, Method, Response, StatusCode};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::time::Instant;
 
 use dt_common::{
     config::config_enums::DbType,
-    error::Error,
+    error::{DtError, DtResultExt, ErrorCode},
     log_error,
     meta::{
         col_value::ColValue,
@@ -21,9 +20,10 @@ use dt_common::{
         row_data::RowData,
         row_type::RowType,
     },
-    monitor::monitor::Monitor,
     utils::{limit_queue::LimitedQueue, sql_util::SqlUtil},
 };
+
+use crate::{call_batch_fn, sinker::base_sinker::BaseSinker, Sinker};
 
 const SIGN_COL_NAME: &str = "_ape_dts_is_deleted";
 const TIMESTAMP_COL_NAME: &str = "_ape_dts_timestamp";
@@ -38,7 +38,7 @@ pub struct StarRocksSinker {
     pub username: String,
     pub password: String,
     pub meta_manager: MysqlMetaManager,
-    pub monitor: Arc<Monitor>,
+    pub base_sinker: BaseSinker,
     pub sync_timestamp: i64,
     pub hard_delete: bool,
 }
@@ -51,7 +51,7 @@ impl Sinker for StarRocksSinker {
         }
 
         if !batch {
-            self.serial_sink(data).await?;
+            self.serial_sink(data.as_mut_slice()).await?;
         } else {
             call_batch_fn!(self, data, Self::batch_sink);
         }
@@ -64,16 +64,18 @@ impl Sinker for StarRocksSinker {
 }
 
 impl StarRocksSinker {
-    async fn serial_sink(&mut self, mut data: Vec<RowData>) -> anyhow::Result<()> {
+    async fn serial_sink(&mut self, data: &mut [RowData]) -> anyhow::Result<()> {
+        let task_id = self.base_sinker.task_id_for_rows(data);
+        self.base_sinker.ensure_monitor_for(&task_id);
         let mut data_size = 0;
-
-        let data = data.as_mut_slice();
         for i in 0..data.len() {
-            data_size += data[i].data_size;
+            data_size += data[i].get_data_size();
             self.send_data(data, i, 1).await?;
         }
 
-        BaseSinker::update_serial_monitor(&self.monitor, data.len() as u64, data_size as u64).await
+        self.base_sinker
+            .update_serial_monitor_for(&task_id, data.len() as u64, data_size)
+            .await
     }
 
     async fn batch_sink(
@@ -82,9 +84,15 @@ impl StarRocksSinker {
         start_index: usize,
         batch_size: usize,
     ) -> anyhow::Result<()> {
+        let task_id = self
+            .base_sinker
+            .task_id_for_rows(&data[start_index..start_index + batch_size]);
+        self.base_sinker.ensure_monitor_for(&task_id);
         let data_size = self.send_data(data, start_index, batch_size).await?;
 
-        BaseSinker::update_batch_monitor(&self.monitor, batch_size as u64, data_size as u64).await
+        self.base_sinker
+            .update_batch_monitor_for(&task_id, batch_size as u64, data_size as u64)
+            .await
     }
 
     async fn send_data(
@@ -102,22 +110,17 @@ impl StarRocksSinker {
         let mut data_size = 0;
         let mut rts = LimitedQueue::new(1);
         // build stream load data
-        let mut load_data = Vec::new();
+        let mut load_data = Vec::with_capacity(batch_size);
         for row_data in data.iter_mut().skip(start_index).take(batch_size) {
-            data_size += row_data.data_size;
-
+            data_size += row_data.get_data_size() as usize;
+            let is_delete = row_data.row_type == RowType::Delete;
             Self::convert_row_data(row_data, tb_meta)?;
+            let col_values = Self::active_col_values_mut(row_data)?;
 
-            let col_values = if row_data.row_type == RowType::Delete {
-                let before = row_data.before.as_mut().unwrap();
-                if self.db_type == DbType::StarRocks {
-                    // SIGN_COL value
-                    before.insert(SIGN_COL_NAME.into(), ColValue::Long(1));
-                }
-                before
-            } else {
-                row_data.after.as_mut().unwrap()
-            };
+            if is_delete && self.db_type == DbType::StarRocks {
+                // SIGN_COL value
+                col_values.insert(SIGN_COL_NAME.into(), ColValue::Long(1));
+            }
 
             if self.db_type == DbType::StarRocks {
                 col_values.insert(
@@ -143,32 +146,30 @@ impl StarRocksSinker {
             op = "delete";
         }
 
-        let body = json!(load_data).to_string();
+        let body = serde_json::to_string(&load_data)?;
         // do stream load
         let url = format!(
             "http://{}:{}/api/{}/{}/_stream_load",
             self.host, self.port, db, tb
         );
-        let request = self.build_request(&url, op, &body)?;
+        let request = self.build_request(&url, op, body)?;
 
         let start_time = Instant::now();
-        let response = self.http_client.execute(request).await?;
+        let response = self
+            .http_client
+            .execute(request)
+            .await
+            .code(ErrorCode::StatementFailed)?;
         rts.push((start_time.elapsed().as_millis() as u64, 1));
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await?;
+        let task_id = self.base_sinker.task_id_for_schema_tb(&db, &tb);
+        self.base_sinker.ensure_monitor_for(&task_id);
+        self.base_sinker
+            .update_monitor_rt_for(&task_id, &rts)
+            .await?;
 
         Self::check_response(response).await?;
 
         Ok(data_size)
-    }
-
-    fn convert_row_data(row_data: &mut RowData, tb_meta: &MysqlTbMeta) -> anyhow::Result<()> {
-        if let Some(before) = &mut row_data.before {
-            Self::convert_col_values(before, tb_meta)?;
-        }
-        if let Some(after) = &mut row_data.after {
-            Self::convert_col_values(after, tb_meta)?;
-        }
-        Ok(())
     }
 
     fn convert_col_values(
@@ -214,7 +215,26 @@ impl StarRocksSinker {
         Ok(())
     }
 
-    fn build_request(&self, url: &str, op: &str, body: &str) -> anyhow::Result<reqwest::Request> {
+    fn convert_row_data(row_data: &mut RowData, tb_meta: &MysqlTbMeta) -> anyhow::Result<()> {
+        if let Some(before) = &mut row_data.before {
+            Self::convert_col_values(before, tb_meta)?;
+        }
+        if let Some(after) = &mut row_data.after {
+            Self::convert_col_values(after, tb_meta)?;
+        }
+        Ok(())
+    }
+
+    fn active_col_values_mut(
+        row_data: &mut RowData,
+    ) -> anyhow::Result<&mut HashMap<String, ColValue>> {
+        match row_data.row_type {
+            RowType::Delete => row_data.require_before_mut(),
+            _ => row_data.require_after_mut(),
+        }
+    }
+
+    fn build_request(&self, url: &str, op: &str, body: String) -> anyhow::Result<reqwest::Request> {
         let password = if self.password.is_empty() {
             None
         } else {
@@ -229,7 +249,7 @@ impl StarRocksSinker {
             .header("format", "json")
             .header("strip_outer_array", "true")
             .header("timezone", "UTC")
-            .body(body.to_string());
+            .body(body);
         // by default, the __op will be upsert
         if !op.is_empty() {
             match self.db_type {
@@ -258,17 +278,21 @@ impl StarRocksSinker {
                 _ => {}
             }
         }
-        Ok(put.build()?)
+        put.build().code(ErrorCode::StatementFailed)
     }
 
     async fn check_response(response: Response) -> anyhow::Result<()> {
         let status_code = response.status();
-        let response_text = &response.text().await?;
+        let response_text = &response.text().await.code(ErrorCode::StatementFailed)?;
         if status_code != StatusCode::OK {
-            bail! {Error::HttpError(format!(
-                "data load request failed, status_code: {}, response_text: {:?}",
-                status_code, response_text
-            ))}
+            return Err(DtError::HttpRejected {
+                status: status_code.as_u16(),
+                detail: format!(
+                    "the destination rejected the request with HTTP status {}",
+                    status_code.as_u16()
+                ),
+            }
+            .into());
         }
 
         // response example:
@@ -289,14 +313,22 @@ impl StarRocksSinker {
         //     "WriteDataTimeMs": 107,
         //     "CommitAndPublishTimeMs": 36
         // }
-        let json_value: Value = serde_json::from_str(response_text)?;
+        let json_value: Value =
+            serde_json::from_str(response_text).context(DtError::HttpRejected {
+                status: status_code.as_u16(),
+                detail: "the destination returned an invalid JSON response".to_string(),
+            })?;
         if json_value["Status"] != "Success" {
             let err = format!(
                 "stream load request failed, status_code: {}, load_result: {}",
                 status_code, response_text,
             );
             log_error!("{}", err);
-            bail! {Error::HttpError(err)}
+            return Err(DtError::HttpRejected {
+                status: status_code.as_u16(),
+                detail: "the destination rejected the data load request".to_string(),
+            }
+            .into());
         }
         Ok(())
     }

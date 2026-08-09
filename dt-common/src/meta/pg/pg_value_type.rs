@@ -7,7 +7,7 @@ const CHAR_OID: i32 = 18;
 const INT8_OID: i32 = 20;
 const INT2_OID: i32 = 21;
 const INT4_OID: i32 = 23;
-const TEXT_OID: i32 = 25;
+pub(super) const TEXT_OID: i32 = 25;
 const OID_OID: i32 = 26;
 // const TID_OID: i32 = 27;
 // const XID_OID: i32 = 28;
@@ -58,8 +58,8 @@ const FLOAT8_ARRAY_OID: i32 = 1022;
 // const ACLITEM_ARRAY_OID: i32 = 1034;
 // const MACADDR_ARRAY_OID: i32 = 1040;
 // const INET_ARRAY_OID: i32 = 1041;
-const BPCHAR_OID: i32 = 1042;
-const VARCHAR_OID: i32 = 1043;
+pub(super) const BPCHAR_OID: i32 = 1042;
+pub(super) const VARCHAR_OID: i32 = 1043;
 const DATE_OID: i32 = 1082;
 const TIME_OID: i32 = 1083;
 const TIMESTAMP_OID: i32 = 1114;
@@ -198,7 +198,7 @@ impl PgValueType {
             "int8" | "oid" => PgValueType::Int64,
             "float4" => PgValueType::Float32,
             "float8" => PgValueType::Float64,
-            "char" => PgValueType::Char,
+            "\"char\"" => PgValueType::Char,
             "text" | "varchar" | "bpchar" => PgValueType::String,
             "bytea" => PgValueType::Bytes,
             "json" | "jsonb" => PgValueType::JSON,
@@ -226,5 +226,12 @@ impl PgValueType {
             "_text" | "_varchar" | "_bpchar" => PgValueType::ArrayString,
             _ => PgValueType::String,
         }
+    }
+
+    pub fn is_integer(&self) -> bool {
+        matches!(
+            self,
+            Self::Int16 { .. } | Self::Int32 { .. } | Self::Int64 { .. }
+        )
     }
 }

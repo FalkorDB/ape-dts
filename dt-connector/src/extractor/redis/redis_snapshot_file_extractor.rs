@@ -1,8 +1,9 @@
+use anyhow::Context;
 use async_trait::async_trait;
 use tokio::{fs::metadata, fs::File, io::AsyncReadExt};
 
 use super::StreamReader;
-use crate::extractor::base_extractor::BaseExtractor;
+use crate::extractor::base_extractor::{BaseExtractor, ExtractState};
 use crate::extractor::redis::rdb::rdb_parser::RdbParser;
 use crate::extractor::redis::rdb::reader::rdb_reader::RdbReader;
 use crate::extractor::redis::redis_psync_extractor::RedisPsyncExtractor;
@@ -15,6 +16,7 @@ pub struct RedisSnapshotFileExtractor {
     pub file_path: String,
     pub filter: RdbFilter,
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
 }
 
 struct RdbFileReader {
@@ -26,10 +28,10 @@ impl Extractor for RedisSnapshotFileExtractor {
     async fn extract(&mut self) -> anyhow::Result<()> {
         let file = File::open(&self.file_path)
             .await
-            .expect("rdb file not found");
+            .context("failed to read the configured Redis snapshot file")?;
         let metadata = metadata(&self.file_path)
             .await
-            .expect("rdb file with wrong meta");
+            .context("failed to read the configured Redis snapshot file")?;
         let mut file_reader = RdbFileReader { file };
         let mut stream_reader: Box<&mut (dyn StreamReader + Send)> = Box::new(&mut file_reader);
 
@@ -57,7 +59,8 @@ impl Extractor for RedisSnapshotFileExtractor {
         loop {
             if let Some(entry) = parser.load_entry().await? {
                 RedisPsyncExtractor::push_to_buf(
-                    &mut self.base_extractor,
+                    &self.base_extractor,
+                    &mut self.extract_state,
                     &mut self.filter,
                     entry,
                     Position::None,
@@ -68,12 +71,14 @@ impl Extractor for RedisSnapshotFileExtractor {
             if parser.is_end {
                 log_info!(
                     "end extracting data from rdb, all count: {}",
-                    self.base_extractor.monitor.counters.pushed_record_count
+                    self.extract_state.monitor.counters.pushed_record_count
                 );
                 break;
             }
         }
-        self.base_extractor.wait_task_finish().await
+        self.base_extractor
+            .wait_task_finish(&mut self.extract_state)
+            .await
     }
 }
 

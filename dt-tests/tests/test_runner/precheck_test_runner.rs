@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use dt_common::config::{config_enums::DbType, task_config::TaskConfig};
+use dt_common::{
+    config::{config_enums::DbType, task_config::TaskConfig},
+    logger::TaskLogger,
+};
 
 use dt_precheck::{
     builder::prechecker_builder::PrecheckerBuilder, config::task_config::PrecheckTaskConfig,
@@ -23,6 +26,7 @@ impl PrecheckTestRunner {
         let base = BaseTestRunner::new(test_dir).await.unwrap();
         let task_config = TaskConfig::new(&base.task_config_file).unwrap();
         let precheck_config = PrecheckTaskConfig::new(&base.task_config_file).unwrap();
+        TaskLogger::new(&task_config).init(true).await?;
         let checker_connector =
             PrecheckerBuilder::build(precheck_config.precheck.clone(), task_config.clone());
 
@@ -46,10 +50,27 @@ impl PrecheckTestRunner {
 
         let compare = |result: &CheckResult, expected_results: &HashMap<String, bool>| {
             if let Some(expected) = expected_results.get(&result.check_type_name) {
-                assert_eq!(&result.is_validate, expected);
+                if &result.is_validate != expected {
+                    println!(
+                        "{} checker: {} expect {}, found {}, dismatch",
+                        if result.is_source { "source" } else { "target" },
+                        result.check_type_name,
+                        expected,
+                        result.is_validate
+                    );
+                    assert!(false)
+                }
             } else {
                 // by default, is_validate == true
-                assert!(&result.is_validate);
+                if !&result.is_validate {
+                    println!(
+                        "{} checker: {} failed: {}",
+                        if result.is_source { "source" } else { "target" },
+                        result.check_type_name,
+                        result.error_msg
+                    );
+                    assert!(false)
+                }
             }
         };
 

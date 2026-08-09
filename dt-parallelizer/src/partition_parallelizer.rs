@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-
-use super::{base_parallelizer::BaseParallelizer, rdb_partitioner::RdbPartitioner};
-use crate::{DataSize, Parallelizer};
 use dt_common::meta::{
     dt_data::{DtData, DtItem},
     dt_queue::DtQueue,
@@ -11,6 +8,9 @@ use dt_common::meta::{
 };
 use dt_common::monitor::counter::Counter;
 use dt_connector::Sinker;
+
+use super::{base_parallelizer::BaseParallelizer, rdb_partitioner::RdbPartitioner};
+use crate::{DataSize, Parallelizer};
 
 pub struct PartitionParallelizer {
     pub base_parallelizer: BaseParallelizer,
@@ -31,10 +31,10 @@ impl Parallelizer for PartitionParallelizer {
     async fn drain(&mut self, buffer: &DtQueue) -> anyhow::Result<Vec<DtItem>> {
         let mut data = Vec::new();
         let mut record_size_counter = Counter::new(0, 0);
-        while let Ok(item) = self
+        while let Some(item) = self
             .base_parallelizer
             .pop(buffer, &mut record_size_counter)
-            .await
+            .await?
         {
             match &item.dt_data {
                 DtData::Dml { row_data } => {
@@ -73,7 +73,8 @@ impl Parallelizer for PartitionParallelizer {
         };
 
         let sub_data = self.partitioner.partition(data, self.parallel_size).await?;
-        self.base_parallelizer
+        let _ = self
+            .base_parallelizer
             .sink_dml(sub_data, sinkers, self.parallel_size, false)
             .await?;
 

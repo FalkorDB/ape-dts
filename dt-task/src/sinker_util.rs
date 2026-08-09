@@ -1,51 +1,48 @@
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use kafka::producer::{Producer, RequiredAcks};
 use reqwest::{redirect::Policy, Url};
-use rusoto_s3::S3Client;
 use sqlx::types::chrono::Utc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use dt_common::{
-    config::{
-        config_enums::DbType, extractor_config::ExtractorConfig, sinker_config::SinkerConfig,
-        task_config::TaskConfig,
-    },
-    meta::redis::command::key_parser::KeyParser,
+    config::{config_enums::DbType, sinker_config::SinkerConfig, task_config::TaskConfig},
+    error::{DtError, DtResultExt, ErrorCode},
     meta::{
         avro::avro_converter::AvroConverter,
+        mongo::mongo_shard::{is_mongos, list_shard_collections},
         mysql::mysql_meta_manager::MysqlMetaManager,
         pg::pg_meta_manager::PgMetaManager,
-        redis::{redis_statistic_type::RedisStatisticType, redis_write_method::RedisWriteMethod},
+        rdb_meta_manager::RdbMetaManager,
+        redis::{
+            command::key_parser::KeyParser, redis_statistic_type::RedisStatisticType,
+            redis_write_method::RedisWriteMethod,
+        },
     },
-    monitor::monitor::Monitor,
+    monitor::{sinker_worker_metrics::SinkerWorkerMetrics, task_monitor_handle::TaskMonitorHandle},
     rdb_filter::RdbFilter,
     utils::redis_util::RedisUtil,
 };
 
 use super::task_util::TaskUtil;
-use crate::extractor_util::ExtractorUtil;
+use crate::{extractor_util::ExtractorUtil, task_util::ConnClient};
 use dt_connector::{
+    checker::CheckerHandle,
     data_marker::DataMarker,
     rdb_router::RdbRouter,
     sinker::{
+        base_sinker::BaseSinker,
+        busy_tracking_sinker::BusyTrackingSinker,
+        checkable_sinker::{wrap_sinker_with_checker, CheckableSink},
         clickhouse::{
             clickhouse_sinker::ClickhouseSinker, clickhouse_struct_sinker::ClickhouseStructSinker,
         },
         dummy_sinker::DummySinker,
-        foxlake::{
-            foxlake_merger::FoxlakeMerger, foxlake_pusher::FoxlakePusher,
-            foxlake_sinker::FoxlakeSinker, foxlake_struct_sinker::FoxlakeStructSinker,
-            orc_sequencer::OrcSequencer,
-        },
         kafka::kafka_sinker::KafkaSinker,
-        mongo::{mongo_checker::MongoChecker, mongo_sinker::MongoSinker},
-        mysql::{
-            mysql_checker::MysqlChecker, mysql_sinker::MysqlSinker,
-            mysql_struct_sinker::MysqlStructSinker,
-        },
-        pg::{pg_checker::PgChecker, pg_sinker::PgSinker, pg_struct_sinker::PgStructSinker},
+        mongo::{mongo_sinker::MongoSinker, mongo_struct_sinker::MongoStructSinker},
+        mysql::{mysql_sinker::MysqlSinker, mysql_struct_sinker::MysqlStructSinker},
+        pg::{pg_sinker::PgSinker, pg_struct_sinker::PgStructSinker},
         redis::{redis_sinker::RedisSinker, redis_statistic_sinker::RedisStatisticSinker},
         sql_sinker::SqlSinker,
         starrocks::{
@@ -61,199 +58,213 @@ pub struct SinkerUtil {}
 
 #[macro_export]
 macro_rules! create_filter {
-    ($task_config:expr,$db_type:ident) => {
-        RdbFilter::from_config(&$task_config.filter, &DbType::$db_type)?
-    };
-}
-
-#[macro_export]
-macro_rules! create_router {
-    ($task_config:expr,$db_type:ident) => {
-        RdbRouter::from_config(&$task_config.router, &DbType::$db_type)?
+    ($config:expr,$db_type:ident) => {
+        RdbFilter::from_config(&$config.filter, &DbType::$db_type)?
     };
 }
 
 impl SinkerUtil {
+    fn parse_http_endpoint(value: &str) -> anyhow::Result<(Url, String, String)> {
+        let url = Url::parse(value).code(ErrorCode::InvalidConfig)?;
+        let host = url.host_str().map(str::to_string).ok_or_else(|| {
+            DtError::invalid_config("the destination HTTP URL must include a host")
+        })?;
+        let port = url.port_or_known_default().ok_or_else(|| {
+            DtError::invalid_config("the destination HTTP URL must include a port")
+        })?;
+        Ok((url, host, port.to_string()))
+    }
+
+    fn push_sinker<S: Sinker + Send + 'static>(
+        sub_sinkers: &mut Sinkers,
+        sinker: S,
+        metrics: &Arc<SinkerWorkerMetrics>,
+    ) {
+        let sinker = BusyTrackingSinker::new(Box::new(sinker), metrics.register_worker());
+        sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+    }
+
+    async fn require_extractor_meta_manager(config: &TaskConfig) -> anyhow::Result<RdbMetaManager> {
+        Ok(ExtractorUtil::get_extractor_meta_manager(config)
+            .await?
+            .ok_or_else(|| {
+                DtError::InvalidConfig(
+                    "the selected sinker requires relational source metadata".to_string(),
+                )
+            })?)
+    }
+
+    fn push_checkable_sinker<S: CheckableSink + Send + 'static>(
+        sub_sinkers: &mut Sinkers,
+        sinker: S,
+        checker: &Option<CheckerHandle>,
+        lifecycle_owner: bool,
+        metrics: &Arc<SinkerWorkerMetrics>,
+    ) {
+        let sinker = wrap_sinker_with_checker(sinker, checker.clone(), lifecycle_owner);
+        let sinker = BusyTrackingSinker::new(sinker, metrics.register_worker());
+        sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+    }
+
     pub async fn create_sinkers(
-        task_config: &TaskConfig,
-        extractor_config: &ExtractorConfig,
-        monitor: Arc<Monitor>,
+        config: &TaskConfig,
+        client: ConnClient,
+        monitor: TaskMonitorHandle,
         data_marker: Option<Arc<RwLock<DataMarker>>>,
+        checker: Option<CheckerHandle>,
     ) -> anyhow::Result<Sinkers> {
-        let log_level = &task_config.runtime.log_level;
+        let log_level = &config.runtime.log_level;
         let enable_sqlx_log = TaskUtil::check_enable_sqlx_log(log_level);
-        let parallel_size = task_config.parallelizer.parallel_size as u32;
+        let parallel_size = config.parallelizer.parallel_size() as u32;
+        let monitor_interval = config.pipeline.checkpoint_interval_secs;
+        let sinker_worker_metrics = monitor.sinker_worker_metrics();
 
         let mut sub_sinkers: Sinkers = Vec::new();
-        match task_config.sinker.clone() {
+        match config.sinker.clone() {
             SinkerConfig::Dummy => {
-                for _ in 0..parallel_size {
+                for index in 0..parallel_size {
                     let sinker = DummySinker {};
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_checkable_sinker(
+                        &mut sub_sinkers,
+                        sinker,
+                        &checker,
+                        index + 1 == parallel_size,
+                        &sinker_worker_metrics,
+                    );
                 }
             }
 
             SinkerConfig::Mysql {
                 url,
+                connection_auth,
                 batch_size,
                 replace,
-                disable_foreign_key_checks,
+                ..
             } => {
-                let router = create_router!(task_config, Mysql);
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    disable_foreign_key_checks,
-                )
-                .await?;
+                let router = RdbRouter::from_config(&config.router, &DbType::Mysql)?;
+
+                let conn_pool = match client {
+                    ConnClient::MySQL(conn_pool) => conn_pool,
+                    _ => {
+                        bail!(DtError::MissingDestinationClient);
+                    }
+                };
                 let meta_manager = MysqlMetaManager::new(conn_pool.clone()).await?;
-                // to avoid contention for monitor write lock between sinker threads,
-                // create a monitor for each sinker instead of sharing a single monitor between sinkers,
-                // sometimes a sinker may cost several millis to get write lock for a global monitor.
-                for _ in 0..parallel_size {
+
+                for index in 0..parallel_size {
                     let sinker = MysqlSinker {
                         url: url.to_string(),
+                        connection_auth: connection_auth.clone(),
                         conn_pool: conn_pool.clone(),
                         meta_manager: meta_manager.clone(),
                         router: router.clone(),
                         batch_size,
-                        monitor: monitor.clone(),
+                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                         data_marker: data_marker.clone(),
                         replace,
                     };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
-                }
-            }
-
-            SinkerConfig::MysqlCheck {
-                url, batch_size, ..
-            } => {
-                // checker needs the reverse router
-                let reverse_router = create_router!(task_config, Mysql).reverse();
-                let filter = create_filter!(task_config, Mysql);
-                let extractor_meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config)
-                    .await?
-                    .unwrap();
-
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    false,
-                )
-                .await?;
-                let meta_manager = MysqlMetaManager::new(conn_pool.clone()).await?;
-
-                for _ in 0..parallel_size {
-                    let sinker = MysqlChecker {
-                        conn_pool: conn_pool.clone(),
-                        meta_manager: meta_manager.clone(),
-                        extractor_meta_manager: extractor_meta_manager.clone(),
-                        reverse_router: reverse_router.clone(),
-                        filter: filter.clone(),
-                        batch_size,
-                        monitor: monitor.clone(),
-                    };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_checkable_sinker(
+                        &mut sub_sinkers,
+                        sinker,
+                        &checker,
+                        index + 1 == parallel_size,
+                        &sinker_worker_metrics,
+                    );
                 }
             }
 
             SinkerConfig::Pg {
                 url,
+                connection_auth,
                 batch_size,
                 replace,
-                disable_foreign_key_checks,
+                ..
             } => {
-                let router = create_router!(task_config, Pg);
-                let conn_pool = TaskUtil::create_pg_conn_pool(
-                    &url,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    disable_foreign_key_checks,
-                )
-                .await?;
+                let router = RdbRouter::from_config(&config.router, &DbType::Pg)?;
+                let conn_pool = match client {
+                    ConnClient::PostgreSQL(conn_pool) => conn_pool,
+                    _ => {
+                        bail!(DtError::MissingDestinationClient);
+                    }
+                };
                 let meta_manager = PgMetaManager::new(conn_pool.clone()).await?;
 
-                for _ in 0..parallel_size {
+                for index in 0..parallel_size {
                     let sinker = PgSinker {
                         url: url.to_string(),
+                        connection_auth: connection_auth.clone(),
                         conn_pool: conn_pool.clone(),
                         meta_manager: meta_manager.clone(),
                         router: router.clone(),
                         batch_size,
-                        monitor: monitor.clone(),
+                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                         data_marker: data_marker.clone(),
                         replace,
                     };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
-                }
-            }
-
-            SinkerConfig::PgCheck {
-                url, batch_size, ..
-            } => {
-                // checker needs the reverse router
-                let reverse_router = create_router!(task_config, Pg).reverse();
-                let filter = create_filter!(task_config, Pg);
-                let extractor_meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config)
-                    .await?
-                    .unwrap();
-
-                let conn_pool =
-                    TaskUtil::create_pg_conn_pool(&url, parallel_size * 2, enable_sqlx_log, false)
-                        .await?;
-                let meta_manager = PgMetaManager::new(conn_pool.clone()).await?;
-
-                for _ in 0..parallel_size {
-                    let sinker = PgChecker {
-                        conn_pool: conn_pool.clone(),
-                        meta_manager: meta_manager.clone(),
-                        extractor_meta_manager: extractor_meta_manager.clone(),
-                        reverse_router: reverse_router.clone(),
-                        filter: filter.clone(),
-                        batch_size,
-                        monitor: monitor.clone(),
-                    };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_checkable_sinker(
+                        &mut sub_sinkers,
+                        sinker,
+                        &checker,
+                        index + 1 == parallel_size,
+                        &sinker_worker_metrics,
+                    );
                 }
             }
 
             SinkerConfig::Mongo {
-                url,
-                app_name,
                 batch_size,
+                require_shard_key_filter,
+                ..
             } => {
-                let router = create_router!(task_config, Mongo);
-                for _ in 0..parallel_size {
-                    let mongo_client = TaskUtil::create_mongo_client(&url, &app_name).await?;
+                let router = RdbRouter::from_config(&config.router, &DbType::Mongo)?;
+                let mongo_client = match client {
+                    ConnClient::MongoDB(mongo_client) => mongo_client,
+                    _ => {
+                        bail!(DtError::MissingDestinationClient);
+                    }
+                };
+                let is_target_mongos = is_mongos(&mongo_client).await?;
+                for index in 0..parallel_size {
                     let sinker = MongoSinker {
                         batch_size,
                         router: router.clone(),
-                        mongo_client,
-                        monitor: monitor.clone(),
+                        mongo_client: mongo_client.clone(),
+                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
+                        target_shard_collections: HashMap::new(),
+                        require_shard_key_filter,
+                        is_target_mongos,
                     };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_checkable_sinker(
+                        &mut sub_sinkers,
+                        sinker,
+                        &checker,
+                        index + 1 == parallel_size,
+                        &sinker_worker_metrics,
+                    );
                 }
             }
 
-            SinkerConfig::MongoCheck {
-                url,
-                app_name,
-                batch_size,
-                ..
+            SinkerConfig::MongoStruct {
+                conflict_policy, ..
             } => {
-                let reverse_router = create_router!(task_config, Mongo).reverse();
-                for _ in 0..parallel_size {
-                    let mongo_client = TaskUtil::create_mongo_client(&url, &app_name).await?;
-                    let sinker = MongoChecker {
-                        batch_size,
-                        reverse_router: reverse_router.clone(),
-                        mongo_client,
-                        monitor: monitor.clone(),
-                    };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
-                }
+                let filter = create_filter!(config, Mongo);
+                let mongo_client = match client {
+                    ConnClient::MongoDB(mongo_client) => mongo_client,
+                    _ => {
+                        bail!(DtError::MissingDestinationClient);
+                    }
+                };
+                let (is_target_mongos, target_shard_collections) =
+                    list_shard_collections(&mongo_client).await?;
+                let sinker = MongoStructSinker {
+                    mongo_client,
+                    conflict_policy,
+                    filter,
+                    base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
+                    target_shard_collections,
+                    is_target_mongos,
+                };
+                Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
             }
 
             SinkerConfig::Kafka {
@@ -263,14 +274,14 @@ impl SinkerUtil {
                 required_acks,
                 with_field_defs,
             } => {
-                let router = RdbRouter::from_config(
-                    &task_config.router,
+                let router = RdbRouter::from_config_for_topic(
+                    &config.router,
                     // use the db_type of extractor
-                    &task_config.extractor_basic.db_type,
+                    &config.extractor_basic.db_type,
                 )?;
                 // kafka sinker may need meta data from RDB extractor
-                let meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config).await?;
-                let avro_converter = AvroConverter::new(meta_manager, with_field_defs);
+                let meta_manager = ExtractorUtil::get_extractor_meta_manager(config).await?;
+                let avro_converter = AvroConverter::new(meta_manager, with_field_defs)?;
 
                 let brokers = vec![url.to_string()];
                 let acks = match required_acks.as_str() {
@@ -282,75 +293,85 @@ impl SinkerUtil {
                 for _ in 0..parallel_size {
                     // TODO, authentication, https://github.com/kafka-rust/kafka-rust/blob/master/examples/example-ssl.rs
                     let producer = Producer::from_hosts(brokers.clone())
-                        .with_ack_timeout(std::time::Duration::from_secs(ack_timeout_secs))
+                        .with_ack_timeout(Duration::from_secs(ack_timeout_secs))
                         .with_required_acks(acks)
                         .create()
-                        .with_context(|| {
-                            format!("failed to create kafka producer, url: [{}]", url)
-                        })?;
+                        .code(ErrorCode::ConnectionFailed)?;
                     // the sending performance of RdkafkaSinker is much worse than KafkaSinker
                     let sinker = KafkaSinker {
                         batch_size,
                         router: router.clone(),
                         producer,
                         avro_converter: avro_converter.clone(),
-                        monitor: monitor.clone(),
+                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                     };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
                 }
             }
 
             SinkerConfig::MysqlStruct {
-                url,
-                conflict_policy,
+                conflict_policy, ..
             } => {
-                let filter = create_filter!(task_config, Mysql);
-                let router = create_router!(task_config, Mysql);
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    false,
-                )
-                .await?;
+                let filter = create_filter!(config, Mysql);
+                let router = RdbRouter::from_config(&config.router, &DbType::Mysql)?;
+
+                let conn_pool = match client {
+                    ConnClient::MySQL(conn_pool) => conn_pool,
+                    _ => {
+                        bail!(DtError::MissingDestinationClient);
+                    }
+                };
                 let sinker = MysqlStructSinker {
-                    conn_pool: conn_pool.clone(),
+                    conn_pool,
                     conflict_policy: conflict_policy.clone(),
                     filter: filter.clone(),
                     router,
+                    base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                 };
-                sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
             }
 
             SinkerConfig::PgStruct {
-                url,
-                conflict_policy,
+                conflict_policy, ..
             } => {
-                let filter = create_filter!(task_config, Pg);
-                let router = create_router!(task_config, Pg);
-                let conn_pool =
-                    TaskUtil::create_pg_conn_pool(&url, parallel_size * 2, enable_sqlx_log, false)
-                        .await?;
+                let filter = create_filter!(config, Pg);
+                let router = RdbRouter::from_config(&config.router, &DbType::Pg)?;
+
+                let conn_pool = match client {
+                    ConnClient::PostgreSQL(conn_pool) => conn_pool,
+                    _ => {
+                        bail!(DtError::MissingDestinationClient);
+                    }
+                };
                 let sinker = PgStructSinker {
-                    conn_pool: conn_pool.clone(),
+                    conn_pool,
                     conflict_policy: conflict_policy.clone(),
                     filter: filter.clone(),
                     router,
+                    base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                 };
-                sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
             }
 
             SinkerConfig::Redis {
                 url,
+                connection_auth,
                 batch_size,
                 method,
                 is_cluster,
             } => {
                 // redis sinker may need meta data from RDB extractor
-                let meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config).await?;
-                let mut conn = RedisUtil::create_redis_conn(&url).await?;
+                let meta_manager = ExtractorUtil::get_extractor_meta_manager(config).await?;
+                let mut conn = RedisUtil::create_redis_conn(&url, &connection_auth)
+                    .await
+                    .context("failed to create Redis sinker connection")?;
+                let is_cluster = RedisUtil::is_redis_cluster(&mut conn, is_cluster);
                 let version = RedisUtil::get_redis_version(&mut conn)?;
                 let method = RedisWriteMethod::from_str(&method)?;
+                let router = RdbRouter::from_config(&config.router, &DbType::Redis)?;
+                if let Some(router) = &router {
+                    router.validate_redis_db_map(is_cluster)?;
+                }
 
                 if is_cluster {
                     let url_info = Url::parse(&url)?;
@@ -364,7 +385,7 @@ impl SinkerUtil {
                         }
 
                         let new_url = format!("redis://{}:{}@{}", username, password, node.address);
-                        let conn = RedisUtil::create_redis_conn(&new_url).await?;
+                        let conn = RedisUtil::create_redis_conn(&new_url, &connection_auth).await?;
                         let sinker = RedisSinker {
                             cluster_node: Some(node.clone()),
                             conn,
@@ -373,15 +394,16 @@ impl SinkerUtil {
                             version,
                             method: method.clone(),
                             meta_manager: meta_manager.clone(),
-                            monitor: monitor.clone(),
+                            base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                             data_marker: data_marker.clone(),
-                            key_parser: KeyParser::new(),
+                            key_parser: KeyParser::new()?,
+                            router: router.clone(),
                         };
-                        sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                        Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
                     }
                 } else {
                     for _ in 0..parallel_size {
-                        let conn = RedisUtil::create_redis_conn(&url).await?;
+                        let conn = RedisUtil::create_redis_conn(&url, &connection_auth).await?;
                         let sinker = RedisSinker {
                             cluster_node: None,
                             conn,
@@ -390,11 +412,12 @@ impl SinkerUtil {
                             version,
                             method: method.clone(),
                             meta_manager: meta_manager.clone(),
-                            monitor: monitor.clone(),
+                            base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                             data_marker: data_marker.clone(),
-                            key_parser: KeyParser::new(),
+                            key_parser: KeyParser::new()?,
+                            router: router.clone(),
                         };
-                        sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                        Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
                     }
                 }
             }
@@ -411,39 +434,42 @@ impl SinkerUtil {
                         statistic_type: statistic_type.clone(),
                         data_size_threshold,
                         freq_threshold,
-                        monitor: monitor.clone(),
+                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                     };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
                 }
             }
 
             SinkerConfig::StarRocks {
                 url,
+                connection_auth,
                 batch_size,
                 stream_load_url,
                 ..
             }
             | SinkerConfig::Doris {
                 url,
+                connection_auth,
                 batch_size,
                 stream_load_url,
             } => {
                 for _ in 0..parallel_size {
-                    let url_info = Url::parse(&stream_load_url)?;
-                    let host = url_info.host_str().unwrap().to_string();
-                    let port = format!("{}", url_info.port().unwrap());
+                    let (url_info, host, port) = Self::parse_http_endpoint(&stream_load_url)?;
                     let username = url_info.username().to_string();
                     let password = url_info.password().unwrap_or("").to_string();
                     let custom = Policy::custom(|attempt| attempt.follow());
                     let http_client = reqwest::Client::builder()
                         .http1_title_case_headers()
                         .redirect(custom)
-                        .build()?;
+                        .build()
+                        .code(ErrorCode::InvalidConfig)?;
                     let conn_pool = TaskUtil::create_mysql_conn_pool(
                         &url,
+                        &DbType::StarRocks,
+                        &connection_auth,
                         parallel_size * 2,
                         enable_sqlx_log,
-                        false,
+                        None,
                     )
                     .await?;
                     let meta_manager = MysqlMetaManager::new_mysql_compatible(
@@ -453,7 +479,7 @@ impl SinkerUtil {
                     .await?;
 
                     let mut sinker = StarRocksSinker {
-                        db_type: task_config.sinker_basic.db_type.clone(),
+                        db_type: config.sinker_basic.db_type.clone(),
                         http_client,
                         host,
                         port,
@@ -461,35 +487,42 @@ impl SinkerUtil {
                         password,
                         batch_size,
                         meta_manager,
-                        monitor: monitor.clone(),
+                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                         sync_timestamp: Utc::now().timestamp_millis(),
                         hard_delete: false,
                     };
-                    if let SinkerConfig::StarRocks { hard_delete, .. } = task_config.sinker {
+                    if let SinkerConfig::StarRocks { hard_delete, .. } = config.sinker {
                         sinker.hard_delete = hard_delete;
                     }
 
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
                 }
             }
 
             SinkerConfig::StarRocksStruct {
                 url,
+                connection_auth,
                 conflict_policy,
             }
             | SinkerConfig::DorisStruct {
                 url,
+                connection_auth,
                 conflict_policy,
             } => {
-                let conn_pool =
-                    TaskUtil::create_mysql_conn_pool(&url, 2, enable_sqlx_log, false).await?;
-                let filter = create_filter!(task_config, Mysql);
-                let router = create_router!(task_config, Mysql);
-                let extractor_meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config)
-                    .await?
-                    .unwrap();
+                let conn_pool = TaskUtil::create_mysql_conn_pool(
+                    &url,
+                    &DbType::StarRocks,
+                    &connection_auth,
+                    2,
+                    enable_sqlx_log,
+                    None,
+                )
+                .await?;
+                let filter = create_filter!(config, Mysql);
+                let router = RdbRouter::from_config(&config.router, &DbType::Mysql)?;
+                let extractor_meta_manager = Self::require_extractor_meta_manager(config).await?;
                 let sinker = StarrocksStructSinker {
-                    db_type: task_config.sinker_basic.db_type.clone(),
+                    db_type: config.sinker_basic.db_type.clone(),
                     conn_pool,
                     conflict_policy,
                     filter,
@@ -497,21 +530,20 @@ impl SinkerUtil {
                     extractor_meta_manager,
                     backend_count: 0,
                 };
-                sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
             }
 
             SinkerConfig::ClickHouse { url, batch_size } => {
                 for _ in 0..parallel_size {
-                    let url_info = Url::parse(&url)?;
-                    let host = url_info.host_str().unwrap().to_string();
-                    let port = format!("{}", url_info.port().unwrap());
+                    let (url_info, host, port) = Self::parse_http_endpoint(&url)?;
                     let username = url_info.username().to_string();
                     let password = url_info.password().unwrap_or("").to_string();
                     let custom = Policy::custom(|attempt| attempt.follow());
                     let http_client = reqwest::Client::builder()
                         .http1_title_case_headers()
                         .redirect(custom)
-                        .build()?;
+                        .build()
+                        .code(ErrorCode::InvalidConfig)?;
                     let sinker = ClickhouseSinker {
                         http_client,
                         host,
@@ -519,10 +551,10 @@ impl SinkerUtil {
                         username,
                         password,
                         batch_size,
-                        monitor: monitor.clone(),
+                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                         sync_timestamp: Utc::now().timestamp_millis(),
                     };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
                 }
             }
 
@@ -531,18 +563,14 @@ impl SinkerUtil {
                 conflict_policy,
                 engine,
             } => {
-                let url_info = Url::parse(&url)?;
-                let host = url_info.host_str().unwrap().to_string();
-                let port = format!("{}", url_info.port().unwrap());
+                let (url_info, host, port) = Self::parse_http_endpoint(&url)?;
                 let client = clickhouse::Client::default()
                     .with_url(format!("http://{}:{}", host, port))
                     .with_user(url_info.username())
                     .with_password(url_info.password().unwrap_or(""));
-                let filter = create_filter!(task_config, Mysql);
-                let router = create_router!(task_config, Mysql);
-                let extractor_meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config)
-                    .await?
-                    .unwrap();
+                let filter = create_filter!(config, Mysql);
+                let router = RdbRouter::from_config(&config.router, &DbType::Mysql)?;
+                let extractor_meta_manager = Self::require_extractor_meta_manager(config).await?;
                 let sinker = ClickhouseStructSinker {
                     client,
                     conflict_policy,
@@ -551,193 +579,47 @@ impl SinkerUtil {
                     router,
                     extractor_meta_manager,
                 };
-                sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
             }
 
             SinkerConfig::Sql { reverse } => {
-                let router = RdbRouter::from_config(
-                    &task_config.router,
-                    &task_config.extractor_basic.db_type,
-                )?;
+                let router =
+                    RdbRouter::from_config(&config.router, &config.extractor_basic.db_type)?;
 
                 for _ in 0..parallel_size {
-                    let meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config)
-                        .await?
-                        .unwrap();
+                    let meta_manager = Self::require_extractor_meta_manager(config).await?;
                     let sinker = SqlSinker {
                         meta_manager,
                         router: router.clone(),
                         reverse,
-                        monitor: monitor.clone(),
+                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                     };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
+                    Self::push_sinker(&mut sub_sinkers, sinker, &sinker_worker_metrics);
                 }
-            }
-
-            SinkerConfig::Foxlake {
-                url,
-                batch_size,
-                batch_memory_mb,
-                s3_config,
-                engine,
-            } => {
-                let router = create_router!(task_config, Mysql);
-                let reverse_router = router.reverse();
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    false,
-                )
-                .await?;
-                let s3_client = TaskUtil::create_s3_client(&s3_config);
-                let orc_sequencer = Arc::new(Mutex::new(OrcSequencer::new()));
-
-                for _ in 0..parallel_size {
-                    let meta_manager =
-                        MysqlMetaManager::new_mysql_compatible(conn_pool.clone(), DbType::Foxlake)
-                            .await?;
-                    let (schema, tb) = match extractor_config.to_owned() {
-                        ExtractorConfig::MysqlSnapshot { db, tb, .. } => (Some(db), Some(tb)),
-                        ExtractorConfig::PgSnapshot { schema, tb, .. } => (Some(schema), Some(tb)),
-                        _ => (None, None),
-                    };
-
-                    let pusher = FoxlakePusher {
-                        url: url.to_string(),
-                        extract_type: task_config.extractor_basic.extract_type.clone(),
-                        meta_manager: meta_manager.clone(),
-                        batch_size,
-                        batch_memory_bytes: batch_memory_mb * 1024 * 1024,
-                        s3_config: s3_config.clone(),
-                        s3_client: s3_client.clone(),
-                        monitor: monitor.clone(),
-                        schema,
-                        tb,
-                        reverse_router: reverse_router.clone(),
-                        orc_sequencer: orc_sequencer.clone(),
-                    };
-
-                    let merger = FoxlakeMerger {
-                        batch_size,
-                        s3_config: s3_config.clone(),
-                        s3_client: s3_client.clone(),
-                        monitor: monitor.clone(),
-                        conn_pool: conn_pool.clone(),
-                        extract_type: task_config.extractor_basic.extract_type.clone(),
-                    };
-
-                    let sinker = FoxlakeSinker {
-                        url: url.to_string(),
-                        meta_manager,
-                        batch_size,
-                        monitor: monitor.clone(),
-                        conn_pool: conn_pool.clone(),
-                        router: router.clone(),
-                        pusher,
-                        merger,
-                        engine: engine.clone(),
-                    };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
-                }
-            }
-
-            SinkerConfig::FoxlakePush {
-                url,
-                batch_size,
-                batch_memory_mb,
-                s3_config,
-            } => {
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    false,
-                )
-                .await?;
-                let s3_client: S3Client = TaskUtil::create_s3_client(&s3_config);
-                let reverse_router = create_router!(task_config, Mysql).reverse();
-                let orc_sequencer = Arc::new(Mutex::new(OrcSequencer::new()));
-
-                for _ in 0..parallel_size {
-                    let meta_manager =
-                        MysqlMetaManager::new_mysql_compatible(conn_pool.clone(), DbType::Foxlake)
-                            .await?;
-                    let (schema, tb) = match extractor_config.to_owned() {
-                        ExtractorConfig::MysqlSnapshot { db, tb, .. } => (Some(db), Some(tb)),
-                        ExtractorConfig::PgSnapshot { schema, tb, .. } => (Some(schema), Some(tb)),
-                        _ => (None, None),
-                    };
-
-                    let sinker = FoxlakePusher {
-                        url: url.to_string(),
-                        extract_type: task_config.extractor_basic.extract_type.clone(),
-                        meta_manager,
-                        batch_size,
-                        batch_memory_bytes: batch_memory_mb * 1024 * 1024,
-                        s3_config: s3_config.clone(),
-                        s3_client: s3_client.clone(),
-                        monitor: monitor.clone(),
-                        schema,
-                        tb,
-                        reverse_router: reverse_router.clone(),
-                        orc_sequencer: orc_sequencer.clone(),
-                    };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
-                }
-            }
-
-            SinkerConfig::FoxlakeMerge {
-                url,
-                batch_size,
-                s3_config,
-            } => {
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    false,
-                )
-                .await?;
-                let s3_client = TaskUtil::create_s3_client(&s3_config);
-
-                for _ in 0..parallel_size {
-                    let sinker = FoxlakeMerger {
-                        batch_size,
-                        s3_config: s3_config.clone(),
-                        s3_client: s3_client.clone(),
-                        monitor: monitor.clone(),
-                        conn_pool: conn_pool.clone(),
-                        extract_type: task_config.extractor_basic.extract_type.clone(),
-                    };
-                    sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
-                }
-            }
-
-            SinkerConfig::FoxlakeStruct {
-                url,
-                conflict_policy,
-                engine,
-            } => {
-                let filter = create_filter!(task_config, Mysql);
-                let router = create_router!(task_config, Mysql);
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    false,
-                )
-                .await?;
-                let sinker = FoxlakeStructSinker {
-                    conn_pool: conn_pool.clone(),
-                    conflict_policy: conflict_policy.clone(),
-                    filter,
-                    router,
-                    engine,
-                };
-                sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
             }
         };
         Ok(sub_sinkers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use dt_common::monitor::sinker_worker_metrics::SinkerWorkerMetrics;
+    use dt_connector::sinker::dummy_sinker::DummySinker;
+
+    use super::{SinkerUtil, Sinkers};
+
+    #[test]
+    fn both_push_helpers_register_workers_on_the_shared_tracker() {
+        let metrics = Arc::new(SinkerWorkerMetrics::default());
+        let mut sinkers = Sinkers::new();
+
+        SinkerUtil::push_sinker(&mut sinkers, DummySinker {}, &metrics);
+        SinkerUtil::push_checkable_sinker(&mut sinkers, DummySinker {}, &None, true, &metrics);
+
+        assert_eq!(sinkers.len(), 2);
+        assert_eq!(metrics.snapshot().configured, 2);
     }
 }

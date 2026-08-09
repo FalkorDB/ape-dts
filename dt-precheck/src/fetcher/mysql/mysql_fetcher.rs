@@ -1,20 +1,25 @@
+use futures::{Stream, TryStreamExt};
 use std::collections::HashMap;
 
 use anyhow::bail;
 use async_trait::async_trait;
-use dt_common::{error::Error, rdb_filter::RdbFilter};
-use dt_task::task_util::TaskUtil;
-use futures::{Stream, TryStreamExt};
-use sqlx::{mysql::MySqlRow, query, MySql, Pool, Row};
+use sqlx::{mysql::MySqlRow, query, Error, MySql, Pool};
 
 use crate::{
     fetcher::traits::Fetcher,
     meta::database_mode::{Constraint, Database, Schema, Table},
 };
+use dt_common::{
+    config::{config_enums::DbType, connection_auth_config::ConnectionAuthConfig},
+    rdb_filter::RdbFilter,
+    utils::sql_util::SqlUtil,
+};
+use dt_task::task_util::TaskUtil;
 
 pub struct MysqlFetcher {
     pub pool: Option<Pool<MySql>>,
     pub url: String,
+    pub connection_auth: ConnectionAuthConfig,
     pub is_source: bool,
     pub filter: RdbFilter,
 }
@@ -22,7 +27,17 @@ pub struct MysqlFetcher {
 #[async_trait]
 impl Fetcher for MysqlFetcher {
     async fn build_connection(&mut self) -> anyhow::Result<()> {
-        self.pool = Some(TaskUtil::create_mysql_conn_pool(&self.url, 1, true, false).await?);
+        self.pool = Some(
+            TaskUtil::create_mysql_conn_pool(
+                &self.url,
+                &DbType::Mysql,
+                &self.connection_auth,
+                1,
+                true,
+                None,
+            )
+            .await?,
+        );
         Ok(())
     }
 
@@ -33,8 +48,8 @@ impl Fetcher for MysqlFetcher {
         let result = self.fetch_all(sql, "mysql query database version").await;
         match result {
             Ok(rows) => {
-                if !rows.is_empty() {
-                    let version_str: String = rows.first().unwrap().get("VERSION");
+                if let Some(row) = rows.first() {
+                    let version_str = SqlUtil::try_get_mysql_string(row, "VERSION")?;
                     version = version_str;
                 }
             }
@@ -67,8 +82,10 @@ impl Fetcher for MysqlFetcher {
         match result {
             Ok(rows) => {
                 for row in rows {
-                    let (variable_name, value): (String, String) =
-                        (row.get("Variable_name"), row.get("Value"));
+                    let (variable_name, value) = (
+                        SqlUtil::try_get_mysql_string(&row, "Variable_name")?,
+                        SqlUtil::try_get_mysql_string(&row, "Value")?,
+                    );
                     if result_map.contains_key(variable_name.as_str()) {
                         result_map.insert(variable_name, value);
                     }
@@ -87,8 +104,8 @@ impl Fetcher for MysqlFetcher {
         let rows_result = self.fetch_row(query_db, "mysql query dbs sql:");
         match rows_result {
             Ok(mut rows) => {
-                while let Some(row) = rows.try_next().await.unwrap() {
-                    let schema_name: String = row.get("SCHEMA_NAME");
+                while let Some(row) = rows.try_next().await? {
+                    let schema_name = SqlUtil::try_get_mysql_string(&row, "SCHEMA_NAME")?;
                     if !self.filter.filter_schema(&schema_name) {
                         results.push(Database {
                             database_name: schema_name,
@@ -113,9 +130,11 @@ impl Fetcher for MysqlFetcher {
         let rows_result = self.fetch_row(query_tb, "mysql query tables sql:");
         match rows_result {
             Ok(mut rows) => {
-                while let Some(row) = rows.try_next().await.unwrap() {
-                    let (db, tb): (String, String) =
-                        (row.get("TABLE_SCHEMA"), row.get("TABLE_NAME"));
+                while let Some(row) = rows.try_next().await? {
+                    let (db, tb) = (
+                        SqlUtil::try_get_mysql_string(&row, "TABLE_SCHEMA")?,
+                        SqlUtil::try_get_mysql_string(&row, "TABLE_NAME")?,
+                    );
                     if !self.filter.filter_tb(&db, &tb) {
                         results.push(Table {
                             database_name: db,
@@ -161,7 +180,7 @@ impl Fetcher for MysqlFetcher {
         let rows_result = self.fetch_row(query_constraint.as_str(), "mysql query constraints sql:");
         match rows_result {
             Ok(mut rows) => {
-                while let Some(row) = rows.try_next().await.unwrap() {
+                while let Some(row) = rows.try_next().await? {
                     let (db, table, rel_db, rel_table, constraint_name, constraint_type): (
                         String,
                         String,
@@ -170,12 +189,12 @@ impl Fetcher for MysqlFetcher {
                         String,
                         String,
                     ) = (
-                        Self::get_str_with_null(&row, "CONSTRAINT_SCHEMA").unwrap(),
-                        Self::get_str_with_null(&row, "TABLE_NAME").unwrap(),
-                        Self::get_str_with_null(&row, "REFERENCED_TABLE_SCHEMA").unwrap(),
-                        Self::get_str_with_null(&row, "REFERENCED_TABLE_NAME").unwrap(),
-                        Self::get_str_with_null(&row, "CONSTRAINT_NAME").unwrap(),
-                        Self::get_str_with_null(&row, "CONSTRAINT_TYPE").unwrap(),
+                        Self::get_str_with_null(&row, "CONSTRAINT_SCHEMA")?,
+                        Self::get_str_with_null(&row, "TABLE_NAME")?,
+                        Self::get_str_with_null(&row, "REFERENCED_TABLE_SCHEMA")?,
+                        Self::get_str_with_null(&row, "REFERENCED_TABLE_NAME")?,
+                        Self::get_str_with_null(&row, "CONSTRAINT_NAME")?,
+                        Self::get_str_with_null(&row, "CONSTRAINT_TYPE")?,
                     );
                     if !self.filter.filter_tb(&db, &table) {
                         results.push(Constraint {
@@ -201,34 +220,30 @@ impl Fetcher for MysqlFetcher {
 }
 
 impl MysqlFetcher {
-    async fn fetch_all(&self, sql: String, mut sql_msg: &str) -> Result<Vec<MySqlRow>, Error> {
+    async fn fetch_all(&self, sql: String, mut sql_msg: &str) -> anyhow::Result<Vec<MySqlRow>> {
         let mysql_pool = match &self.pool {
             Some(pool) => pool,
-            None => return Err(Error::from(sqlx::Error::PoolClosed)),
+            None => return Err(Error::PoolClosed.into()),
         };
 
         sql_msg = if sql_msg.is_empty() { "sql" } else { sql_msg };
         println!("{}: {}", sql_msg, sql);
 
-        let rows_result = query(&sql).fetch_all(mysql_pool).await;
-        match rows_result {
-            Ok(rows) => Ok(rows),
-            Err(e) => Err(Error::from(e)),
-        }
+        Ok(query(&sql).fetch_all(mysql_pool).await?)
     }
 
     fn fetch_row<'a>(
         &self,
         sql: &'a str,
         mut sql_msg: &str,
-    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<MySqlRow, sqlx::Error>> + 'a> {
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<MySqlRow>> + 'a> {
         match &self.pool {
             Some(pool) => {
                 sql_msg = if sql_msg.is_empty() { "sql" } else { sql_msg };
                 println!("{}: {}", sql_msg, sql);
-                Ok(query(sql).fetch(pool))
+                Ok(query(sql).fetch(pool).err_into::<anyhow::Error>())
             }
-            None => bail! {Error::from(sqlx::Error::PoolClosed)},
+            None => bail! {Error::PoolClosed},
         }
     }
 
@@ -238,11 +253,6 @@ impl MysqlFetcher {
     }
 
     fn get_str_with_null(row: &MySqlRow, col_name: &str) -> anyhow::Result<String> {
-        let mut str_val = String::new();
-        let str_val_option = row.get(col_name);
-        if let Some(s) = str_val_option {
-            str_val = s;
-        }
-        Ok(str_val)
+        Ok(SqlUtil::try_get_mysql_optional_string(row, col_name)?.unwrap_or_default())
     }
 }

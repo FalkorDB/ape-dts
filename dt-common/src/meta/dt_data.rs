@@ -1,11 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{
-    ddl_meta::ddl_data::DdlData, foxlake::s3_file_meta::S3FileMeta, row_data::RowData,
-    struct_meta::struct_data::StructData,
-};
+use super::{ddl_meta::ddl_data::DdlData, row_data::RowData, struct_meta::struct_data::StructData};
 use crate::meta::dcl_meta::dcl_data::DclData;
+use crate::meta::row_type::RowSqlType;
 use crate::meta::{position::Position, redis::redis_entry::RedisEntry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +20,14 @@ impl DtItem {
 
     pub fn is_dcl(&self) -> bool {
         self.dt_data.is_dcl()
+    }
+
+    pub fn get_row_sql_type(&self) -> RowSqlType {
+        match &self.dt_data {
+            DtData::Ddl { .. } => RowSqlType::DDL,
+            DtData::Dcl { .. } => RowSqlType::DCL,
+            _ => RowSqlType::DML,
+        }
     }
 
     pub fn get_data_size(&self) -> u64 {
@@ -52,9 +58,6 @@ pub enum DtData {
     Redis {
         entry: RedisEntry,
     },
-    Foxlake {
-        file_meta: S3FileMeta,
-    },
 }
 
 impl DtData {
@@ -80,7 +83,6 @@ impl DtData {
             DtData::Dcl { dcl_data } => dcl_data.get_malloc_size(),
             DtData::Ddl { ddl_data } => ddl_data.get_malloc_size(),
             DtData::Redis { entry } => entry.get_data_malloc_size() as u64,
-            DtData::Foxlake { file_meta } => file_meta.data_size as u64,
             // ignore other item types
             _ => 0,
         }
@@ -88,7 +90,7 @@ impl DtData {
 
     pub fn get_data_count(&self) -> usize {
         match &self {
-            DtData::Foxlake { file_meta } => file_meta.row_count,
+            DtData::Begin {} | DtData::Commit { .. } | DtData::Heartbeat {} => 0,
             _ => 1,
         }
     }

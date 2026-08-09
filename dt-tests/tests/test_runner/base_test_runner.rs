@@ -1,4 +1,4 @@
-use dt_common::{config::task_config::TaskConfig, utils::time_util::TimeUtil};
+use dt_common::{config::task_config::TaskConfig, logger::TaskLogger, utils::time_util::TimeUtil};
 use dt_connector::data_marker::DataMarker;
 use dt_task::task_runner::TaskRunner;
 use std::{
@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::test_config_util::TestConfigUtil;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct BaseTestRunner {
     pub test_dir: String,
     pub task_config_file: String,
@@ -23,11 +23,22 @@ pub struct BaseTestRunner {
     pub meta_center_prepare_sqls: Vec<String>,
 }
 
-static mut LOG4RS_INITED: bool = false;
+#[derive(Clone, Copy)]
+pub enum SqlLoadStrategy {
+    Semicolon,
+    Line,
+}
 
 #[allow(dead_code)]
 impl BaseTestRunner {
     pub async fn new(relative_test_dir: &str) -> anyhow::Result<Self> {
+        Self::new_with_sql_load_strategy(relative_test_dir, SqlLoadStrategy::Semicolon).await
+    }
+
+    pub async fn new_with_sql_load_strategy(
+        relative_test_dir: &str,
+        sql_load_strategy: SqlLoadStrategy,
+    ) -> anyhow::Result<Self> {
         let test_dir = TestConfigUtil::get_absolute_path(relative_test_dir);
 
         let dst_task_config_file =
@@ -43,7 +54,7 @@ impl BaseTestRunner {
             src_clean_sqls,
             dst_clean_sqls,
             meta_center_prepare_sqls,
-        ) = Self::load_sqls(&test_dir);
+        ) = Self::load_sqls(&test_dir, sql_load_strategy);
 
         Ok(Self {
             task_config_file: dst_task_config_file,
@@ -91,18 +102,21 @@ impl BaseTestRunner {
     }
 
     pub async fn start_task(&self) -> anyhow::Result<()> {
-        let enable_log4rs = Self::get_enable_log4rs();
-        TaskRunner::new(&self.task_config_file)?
-            .start_task(enable_log4rs)
-            .await
+        Self::start_task_with_config_file(&self.task_config_file).await
     }
 
     pub async fn spawn_task(&self) -> anyhow::Result<JoinHandle<()>> {
-        let enable_log4rs = Self::get_enable_log4rs();
-        let task_runner = TaskRunner::new(&self.task_config_file)?;
-        let task =
-            tokio::spawn(async move { task_runner.start_task(enable_log4rs).await.unwrap() });
+        let task_config = TaskConfig::new(&self.task_config_file)?;
+        TaskLogger::new(&task_config).init(false).await?;
+        let task_runner = TaskRunner::new(task_config)?;
+        let task = tokio::spawn(async move { task_runner.start_task(false).await.unwrap() });
         Ok(task)
+    }
+
+    pub async fn start_task_with_config_file(task_config_file: &str) -> anyhow::Result<()> {
+        let task_config = TaskConfig::new(task_config_file)?;
+        TaskLogger::new(&task_config).init(false).await?;
+        TaskRunner::new(task_config)?.start_task(false).await
     }
 
     pub async fn abort_task(&self, task: &JoinHandle<()>) -> anyhow::Result<()> {
@@ -118,16 +132,6 @@ impl BaseTestRunner {
             TimeUtil::sleep_millis(1).await;
         }
         Ok(())
-    }
-
-    pub fn get_enable_log4rs() -> bool {
-        // all tests will be run in one process, and log4rs can only be inited once
-        let enable_log4rs = !unsafe { LOG4RS_INITED };
-
-        if enable_log4rs {
-            unsafe { LOG4RS_INITED = true };
-        }
-        enable_log4rs
     }
 
     pub fn load_file(file_path: &str) -> Vec<String> {
@@ -148,6 +152,7 @@ impl BaseTestRunner {
     #[allow(clippy::type_complexity)]
     fn load_sqls(
         test_dir: &str,
+        sql_load_strategy: SqlLoadStrategy,
     ) -> (
         Vec<String>,
         Vec<String>,
@@ -162,7 +167,7 @@ impl BaseTestRunner {
             if !Self::check_path_exists(&full_sql_path) {
                 return Vec::new();
             }
-            Self::load_sql_file(&full_sql_path)
+            Self::load_sql_file(&full_sql_path, sql_load_strategy)
         };
 
         (
@@ -176,54 +181,166 @@ impl BaseTestRunner {
         )
     }
 
-    fn load_sql_file(sql_file: &str) -> Vec<String> {
-        /* sqls content E.g. :
-        -- this is comment
+    /// Simplified SQL parser based on line aggregation.
+    /// 1. Handles multi-line SQLs automatically.
+    /// 2. Handles standard SQLs split across lines (e.g. INSERT VALUES ...) by waiting for a semicolon ';'.
+    /// 3. Ignores lines starting with '--'.
+    fn load_sql_file(sql_file: &str, sql_load_strategy: SqlLoadStrategy) -> Vec<String> {
+        let lines = Self::load_file(sql_file);
+        if matches!(sql_load_strategy, SqlLoadStrategy::Line) {
+            return Self::load_sql_file_by_line(lines);
+        }
 
-        select * from db_1.tb_1;  -- a sql in single line
-
-        ```
-        -- a sql in multiple lines
-        select *
-        from
-        db_1.tb_1;
-        ```
-        */
         let mut sqls = Vec::new();
-        let mut in_block = false;
-        let mut multi_line_sql = String::new();
+        let mut current_sql = String::new();
+        let mut in_backtick_block = false;
+        let mut dollar_tag: Option<String> = None;
 
-        for line in Self::load_file(sql_file).iter() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with("--") {
-                continue;
-            }
+        for line in lines {
+            let trimmed_line = line.trim();
 
-            if line.starts_with("```") {
-                if in_block {
-                    // block end
-                    in_block = false;
-                    if !multi_line_sql.is_empty() {
-                        // pop the last '\n'
-                        multi_line_sql.pop();
-                        sqls.push(multi_line_sql.clone());
+            // 1. Handle ``` wrapped blocks
+            if trimmed_line.starts_with("```") {
+                if in_backtick_block {
+                    in_backtick_block = false;
+                    if !current_sql.is_empty() {
+                        sqls.push(Self::flush_sql(&mut current_sql));
                     }
                 } else {
-                    // block start
-                    in_block = true;
-                    multi_line_sql.clear();
+                    in_backtick_block = true;
+                    current_sql.clear();
                 }
                 continue;
             }
 
-            if in_block {
-                multi_line_sql.push_str(line);
-                multi_line_sql.push('\n');
+            // 2. In ``` block: keep everything untouched
+            if in_backtick_block {
+                current_sql.push_str(&line);
+                current_sql.push('\n');
+                continue;
+            }
+
+            // 3. Inside PostgreSQL dollar-quoted blocks, ignore inner semicolons
+            if let Some(tag) = &dollar_tag {
+                current_sql.push_str(&line);
+                current_sql.push('\n');
+
+                if trimmed_line.contains(tag) {
+                    dollar_tag = None;
+                    if trimmed_line.ends_with(';') {
+                        sqls.push(Self::flush_sql(&mut current_sql));
+                    }
+                }
+                continue;
+            }
+
+            // 4. Normal mode: strip inline comments
+            let line_content = if let Some(idx) = line.find("--") {
+                &line[..idx]
             } else {
-                sqls.push(line.into());
+                &line
+            };
+
+            let trimmed_content = line_content.trim();
+
+            if trimmed_content.is_empty() {
+                continue;
+            }
+
+            if trimmed_content.starts_with("use ") {
+                if !current_sql.trim().is_empty() {
+                    sqls.push(Self::flush_sql(&mut current_sql));
+                }
+                let use_stmt = trimmed_content.trim_end_matches(';').to_string();
+                sqls.push(use_stmt);
+                continue;
+            }
+
+            // Detect start of dollar-quoted blocks like $$ ... $$ or $BODY$ ... $BODY$
+            if let Some(tag) = Self::extract_dollar_tag(trimmed_content) {
+                let tag_count = trimmed_content.matches(&tag).count();
+                current_sql.push_str(trimmed_content);
+                current_sql.push('\n');
+
+                if tag_count >= 2 {
+                    if trimmed_content.ends_with(';') {
+                        sqls.push(Self::flush_sql(&mut current_sql));
+                    }
+                    continue;
+                }
+
+                dollar_tag = Some(tag);
+                continue;
+            }
+
+            current_sql.push_str(trimmed_content);
+            current_sql.push(' ');
+
+            // If this line ends with a semicolon, the statement is finished
+            if trimmed_content.ends_with(';') {
+                sqls.push(Self::flush_sql(&mut current_sql));
+            }
+        }
+
+        // Push any remaining SQL (e.g., file ends without semicolon)
+        if !current_sql.trim().is_empty() {
+            sqls.push(Self::flush_sql(&mut current_sql));
+        }
+
+        sqls
+    }
+
+    fn load_sql_file_by_line(lines: Vec<String>) -> Vec<String> {
+        let mut sqls = Vec::new();
+        for line in lines {
+            let line_content = if let Some(idx) = line.find("--") {
+                &line[..idx]
+            } else {
+                &line
+            };
+
+            let sql = line_content.trim().trim_end_matches(';').trim();
+            if !sql.is_empty() {
+                sqls.push(sql.to_string());
             }
         }
         sqls
+    }
+
+    fn flush_sql(current_sql: &mut String) -> String {
+        let sql = current_sql.trim().trim_end_matches(';').to_string();
+        current_sql.clear();
+        sql
+    }
+
+    fn extract_dollar_tag(line: &str) -> Option<String> {
+        let bytes = line.as_bytes();
+        let mut idx = 0;
+        while idx < bytes.len() {
+            if bytes[idx] != b'$' {
+                idx += 1;
+                continue;
+            }
+
+            if idx + 1 < bytes.len() && bytes[idx + 1] == b'$' {
+                return Some("$$".to_string());
+            }
+
+            let tag_start = idx + 1;
+            let mut tag_end = tag_start;
+            while tag_end < bytes.len()
+                && (bytes[tag_end].is_ascii_alphanumeric() || bytes[tag_end] == b'_')
+            {
+                tag_end += 1;
+            }
+
+            if tag_end > tag_start && tag_end < bytes.len() && bytes[tag_end] == b'$' {
+                return Some(line[idx..=tag_end].to_string());
+            }
+
+            idx += 1;
+        }
+        None
     }
 
     pub fn check_path_exists(file: &str) -> bool {
@@ -239,5 +356,30 @@ impl BaseTestRunner {
             return Some(data_marker);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BaseTestRunner;
+
+    #[test]
+    fn load_sql_file_by_line_keeps_one_redis_command_per_line() {
+        let sqls = BaseTestRunner::load_sql_file_by_line(vec![
+            "-- comment".to_string(),
+            "SET key_1 value_1".to_string(),
+            "HSET key_2 field value;".to_string(),
+            "   ".to_string(),
+            "LPUSH key_3 value -- inline comment".to_string(),
+        ]);
+
+        assert_eq!(
+            sqls,
+            vec![
+                "SET key_1 value_1".to_string(),
+                "HSET key_2 field value".to_string(),
+                "LPUSH key_3 value".to_string(),
+            ]
+        );
     }
 }

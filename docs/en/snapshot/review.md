@@ -18,10 +18,15 @@ extract_type=check_log
 check_log_dir=./dt-tests/tests/mysql_to_mysql/revise/basic_test/check_log
 
 [sinker]
+db_type=mysql
 sink_type=check
+url=mysql://user:pass@host:3306/db
+
+[checker]
+
 
 [parallelizer]
-parallel_type=rdb_check
+parallel_type=rdb_merge
 ```
 
 # Other configurations
